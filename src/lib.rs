@@ -2,29 +2,35 @@
 use soroban_sdk::{contract, contracttype, contractimpl, contractclient, Address, Env, Vec, Symbol, token, testutils::{Address as TestAddress, Arbitrary as TestArbitrary}, arbitrary::{Arbitrary, Unstructured}};
 
 // --- DATA STRUCTURES ---
+const YIELD_LIQUIDITY_BUFFER_SECS: u64 = 60 * 60;
+const DURATION_CHANGE_NOTICE_SECS: u64 = 72 * 60 * 60;
 
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    // Legacy: Single admin (deprecated)
     Admin,
-    // Multi-sig admin system
-    AdminList,
-    AdminThreshold,
-    // Pending admin operations
-    PendingOperation(u64),
-    OperationCounter,
+    LendingPool,
     Circle(u64),
     Member(Address),
     CircleCount,
     // New: Tracks if a user has paid for a specific circle (CircleID, UserAddress)
     Deposit(u64, Address),
+    // New: Tracks pending exits (CircleID, MemberAddress)
+    PendingExit(u64, Address),
     // New: Tracks Group Reserve balance for penalties
     GroupReserve,
     // New: Tracks scheduled payout time for delayed release
     ScheduledPayoutTime(u64),
     // New: Tracks individual contributions for current round (CircleID, MemberIndex)
     CurrentRoundContribution(u64, u32),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum MemberStatus {
+    Active,
+    AwaitingReplacement,
+    Ejected,
 }
 
 #[contracttype]
@@ -49,6 +55,8 @@ pub struct AdminOperation {
     pub approvals: Vec<Address>,
     pub created_at: u64,
     pub is_executed: bool,
+    pub status: MemberStatus,
+    pub total_contributed: u64,
 }
 
 #[contracttype]
@@ -64,6 +72,8 @@ pub struct CircleInfo {
     pub token: Address, // The token used (USDC, XLM)
     pub deadline_timestamp: u64, // Deadline for on-time payments
     pub cycle_duration: u64, // Duration of each payment cycle in seconds
+    pub pending_cycle_duration: u64,
+    pub duration_change_effective_at: u64,
     pub contribution_bitmap: u64,
     pub payout_bitmap: u64,
     pub insurance_balance: u64,
@@ -76,6 +86,16 @@ pub struct CircleInfo {
     pub is_round_finalized: bool, // New: Track if round is finalized
     pub current_pot_recipient: Address, // New: Track who can claim the pot
     pub member_addresses: Vec<Address>, // New: Track member addresses for efficient lookup
+    pub yield_deposited: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GroupHealthUpdateEvent {
+    pub group_id: u64,
+    pub missed_payments: u32,
+    pub active_members: u32,
+    pub trust_score: u32,
 }
 
 // --- CONTRACT TRAIT ---
@@ -83,13 +103,9 @@ pub struct CircleInfo {
 pub trait SoroSusuTrait {
     // Initialize the contract
     fn init(env: Env, admin: Address);
-    
-    // Multi-sig admin functions
-    fn init_multi_sig_admin(env: Env, admin_list: Vec<Address>, threshold: u32);
-    fn add_admin(env: Env, caller: Address, new_admin: Address) -> u64;
-    fn remove_admin(env: Env, caller: Address, admin_to_remove: Address) -> u64;
-    fn update_threshold(env: Env, caller: Address, new_threshold: u32) -> u64;
-    fn approve_operation(env: Env, caller: Address, operation_id: u64);
+
+    // Set the lending pool used for idle-fund yield strategy (admin only)
+    fn set_lending_pool(env: Env, admin: Address, pool: Address);
     
     // Create a new savings circle
     fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32, nft_contract: Address) -> u64;
@@ -100,55 +116,29 @@ pub trait SoroSusuTrait {
     // Make a deposit (Pay your weekly/monthly due)
     fn deposit(env: Env, user: Address, circle_id: u64);
 
-    // Trigger insurance to cover a default (now multi-sig)
-    fn propose_trigger_insurance(env: Env, caller: Address, circle_id: u64, member: Address) -> u64;
+    // Move idle pot funds to the lending pool.
+    fn deposit_to_yield_pool(env: Env, caller: Address, circle_id: u64, amount: u64);
+
+    // Withdraw all supplied idle funds back to the contract for payouts.
+    fn prepare_payout_liquidity(env: Env, caller: Address, circle_id: u64);
+
+    // Trigger insurance to cover a default
+    fn trigger_insurance_coverage(env: Env, caller: Address, circle_id: u64, member: Address);
 
     // Propose a change to the late fee penalty
     fn propose_penalty_change(env: Env, user: Address, circle_id: u64, new_bps: u32);
 
+    // Propose a change to the round duration (takes effect after 72 hours)
+    fn propose_duration_change(env: Env, user: Address, circle_id: u64, new_duration: u64);
+
     // Vote on the current proposal
     fn vote_penalty_change(env: Env, user: Address, circle_id: u64);
 
-    // Eject a member (now multi-sig)
-    fn propose_eject_member(env: Env, caller: Address, circle_id: u64, member: Address) -> u64;
-
-    // Finalize a round (now multi-sig)
-    fn propose_finalize_round(env: Env, caller: Address, circle_id: u64) -> u64;
-
-    // Claim the pot after delay period
-    fn claim_pot(env: Env, caller: Address, circle_id: u64);
-}
-
-// --- HELPER FUNCTIONS ---
-
-// Check if address is admin (supports both legacy and multi-sig)
-fn is_admin(env: &Env, address: &Address) -> bool {
-    // Check multi-sig admin list first
-    if let Some(admin_list) = env.storage().instance().get(&DataKey::AdminList) {
-        let admin_list: Vec<Address> = admin_list;
-        for admin in admin_list.iter() {
-            if admin == address {
-                return true;
-            }
-        }
-        return false;
-    }
+    // Eject a member (burns NFT)
+    fn eject_member(env: Env, caller: Address, circle_id: u64, member: Address);
     
-    // Fallback to legacy single admin
-    if let Some(legacy_admin) = env.storage().instance().get(&DataKey::Admin) {
-        return legacy_admin == *address;
-    }
-    
-    false
-}
-
-// Create a new admin operation
-fn create_operation(env: &Env, operation_type: u8, caller: Address, target_member: Option<Address>, circle_id: u64) -> u64 {
-    let mut operation_counter: u64 = env.storage().instance()
-        .get(&DataKey::OperationCounter)
-        .unwrap_or(0);
-    
-    operation_counter += 1;
+    // Request graceful exit from the circle
+    fn request_exit(env: Env, user: Address, circle_id: u64);
     
     let operation = AdminOperation {
         id: operation_counter,
@@ -313,12 +303,20 @@ fn execute_trigger_insurance(env: &Env, operation: &AdminOperation) {
     env.storage().instance().set(&contribution_key, &member_contribution_amount);
 
     env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    // Fill a vacancy left by a member who requested graceful exit
+    fn fill_vacancy(env: Env, new_member: Address, circle_id: u64, exiting_member_address: Address);
 }
 
 #[contractclient(name = "SusuNftClient")]
 pub trait SusuNftTrait {
     fn mint(env: Env, to: Address, token_id: u128);
     fn burn(env: Env, from: Address, token_id: u128);
+}
+
+#[contractclient(name = "LendingPoolClient")]
+pub trait LendingPoolTrait {
+    fn supply(env: Env, token: Address, from: Address, amount: u64);
+    fn withdraw(env: Env, token: Address, to: Address, amount: u64);
 }
 
 // --- IMPLEMENTATION ---
@@ -333,160 +331,18 @@ impl SoroSusuTrait for SoroSusu {
         if !env.storage().instance().has(&DataKey::CircleCount) {
             env.storage().instance().set(&DataKey::CircleCount, &0u64);
         }
-        // Set the admin (legacy support)
+        // Set the admin
         env.storage().instance().set(&DataKey::Admin, &admin);
-        
-        // Initialize operation counter
-        if !env.storage().instance().has(&DataKey::OperationCounter) {
-            env.storage().instance().set(&DataKey::OperationCounter, &0u64);
-        }
     }
 
-    fn init_multi_sig_admin(env: Env, admin_list: Vec<Address>, threshold: u32) {
-        // Validate inputs
-        if admin_list.is_empty() {
-            panic!("Admin list cannot be empty");
+    fn set_lending_pool(env: Env, admin: Address, pool: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not initialized");
+        if admin != stored_admin {
+            panic!("Unauthorized");
         }
-        if threshold == 0 || threshold > admin_list.len() as u32 {
-            panic!("Invalid threshold");
-        }
-        
-        // Set admin list and threshold
-        env.storage().instance().set(&DataKey::AdminList, &admin_list);
-        env.storage().instance().set(&DataKey::AdminThreshold, &threshold);
-        
-        // Initialize operation counter if not exists
-        if !env.storage().instance().has(&DataKey::OperationCounter) {
-            env.storage().instance().set(&DataKey::OperationCounter, &0u64);
-        }
-    }
 
-    fn add_admin(env: Env, caller: Address, new_admin: Address) -> u64 {
-        caller.require_auth();
-        
-        // Check if caller is admin
-        if !is_admin(&env, &caller) {
-            panic!("Unauthorized: Caller is not an admin");
-        }
-        
-        let mut admin_list: Vec<Address> = env.storage().instance()
-            .get(&DataKey::AdminList)
-            .unwrap_or_else(|| Vec::new(&env));
-        
-        // Check if admin already exists
-        for admin in admin_list.iter() {
-            if admin == &new_admin {
-                panic!("Admin already exists");
-            }
-        }
-        
-        admin_list.push_back(new_admin);
-        env.storage().instance().set(&DataKey::AdminList, &admin_list);
-        
-        1 // Success
-    }
-
-    fn remove_admin(env: Env, caller: Address, admin_to_remove: Address) -> u64 {
-        caller.require_auth();
-        
-        // Check if caller is admin
-        if !is_admin(&env, &caller) {
-            panic!("Unauthorized: Caller is not an admin");
-        }
-        
-        let mut admin_list: Vec<Address> = env.storage().instance()
-            .get(&DataKey::AdminList)
-            .unwrap_or_else(|| Vec::new(&env));
-        
-        let mut found = false;
-        let mut new_admin_list = Vec::new(&env);
-        
-        for admin in admin_list.iter() {
-            if admin == &admin_to_remove {
-                found = true;
-            } else {
-                new_admin_list.push_back(admin.clone());
-            }
-        }
-        
-        if !found {
-            panic!("Admin not found");
-        }
-        
-        // Check threshold validity
-        let threshold: u32 = env.storage().instance()
-            .get(&DataKey::AdminThreshold)
-            .unwrap_or(1);
-        
-        if threshold > new_admin_list.len() as u32 {
-            panic!("Cannot remove admin: threshold would exceed remaining admins");
-        }
-        
-        env.storage().instance().set(&DataKey::AdminList, &new_admin_list);
-        
-        1 // Success
-    }
-
-    fn update_threshold(env: Env, caller: Address, new_threshold: u32) -> u64 {
-        caller.require_auth();
-        
-        // Check if caller is admin
-        if !is_admin(&env, &caller) {
-            panic!("Unauthorized: Caller is not an admin");
-        }
-        
-        let admin_list: Vec<Address> = env.storage().instance()
-            .get(&DataKey::AdminList)
-            .unwrap_or_else(|| Vec::new(&env));
-        
-        if new_threshold == 0 || new_threshold > admin_list.len() as u32 {
-            panic!("Invalid threshold");
-        }
-        
-        env.storage().instance().set(&DataKey::AdminThreshold, &new_threshold);
-        
-        1 // Success
-    }
-
-    fn approve_operation(env: Env, caller: Address, operation_id: u64) {
-        caller.require_auth();
-        
-        // Check if caller is admin
-        if !is_admin(&env, &caller) {
-            panic!("Unauthorized: Caller is not an admin");
-        }
-        
-        let mut operation: AdminOperation = env.storage().instance()
-            .get(&DataKey::PendingOperation(operation_id))
-            .unwrap_or_else(|| panic!("Operation not found"));
-        
-        if operation.is_executed {
-            panic!("Operation already executed");
-        }
-        
-        // Check if already approved
-        for approver in operation.approvals.iter() {
-            if approver == &caller {
-                panic!("Already approved");
-            }
-        }
-        
-        // Add approval
-        operation.approvals.push_back(caller);
-        
-        // Check if threshold met
-        let threshold: u32 = env.storage().instance()
-            .get(&DataKey::AdminThreshold)
-            .unwrap_or(1);
-        
-        if operation.approvals.len() >= threshold as u32 {
-            // Execute operation
-            execute_operation(&env, &operation);
-            operation.is_executed = true;
-        }
-        
-        // Save operation
-        env.storage().instance().set(&DataKey::PendingOperation(operation_id), &operation);
+        env.storage().instance().set(&DataKey::LendingPool, &pool);
     }
 
     fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32, nft_contract: Address) -> u64 {
@@ -517,6 +373,8 @@ impl SoroSusuTrait for SoroSusu {
             token,
             deadline_timestamp: current_time + cycle_duration,
             cycle_duration,
+            pending_cycle_duration: 0,
+            duration_change_effective_at: 0,
             contribution_bitmap: 0,
             payout_bitmap: 0,
             insurance_balance: 0,
@@ -529,6 +387,7 @@ impl SoroSusuTrait for SoroSusu {
             is_round_finalized: false,
             current_pot_recipient: creator.clone(), // Initialize with creator
             member_addresses: Vec::new(&env), // Initialize empty member addresses vector
+            yield_deposited: 0,
         };
 
         // 4. Save the Circle and the new Count
@@ -575,6 +434,8 @@ impl SoroSusuTrait for SoroSusu {
             last_contribution_time: 0,
             is_active: true,
             tier_multiplier,
+            status: MemberStatus::Active,
+            total_contributed: 0,
         };
         
         // 7. Store the member and update circle count
@@ -598,14 +459,28 @@ impl SoroSusuTrait for SoroSusu {
 
         // 2. Load the Circle Data
         let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let current_time = env.ledger().timestamp();
+
+        // Keep pot liquid before deadline by recalling supplied funds.
+        if circle.yield_deposited > 0 && current_time + YIELD_LIQUIDITY_BUFFER_SECS >= circle.deadline_timestamp {
+            let lending_pool: Address = env.storage().instance().get(&DataKey::LendingPool)
+                .unwrap_or_else(|| panic!("Lending pool not configured"));
+            let lending_client = LendingPoolClient::new(&env, &lending_pool);
+            lending_client.withdraw(
+                &circle.token,
+                &env.current_contract_address(),
+                &circle.yield_deposited,
+            );
+            circle.yield_deposited = 0;
+        }
 
         // 3. Check if user is actually a member
         let member_key = DataKey::Member(user.clone());
         let mut member: Member = env.storage().instance().get(&member_key)
             .unwrap_or_else(|| panic!("User is not a member of this circle"));
 
-        if !member.is_active {
-            panic!("Member is ejected");
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
         }
 
         // 4. Create the Token Client
@@ -645,6 +520,7 @@ impl SoroSusuTrait for SoroSusu {
         // 7. Update member contribution info
         member.contribution_count += 1;
         member.last_contribution_time = current_time;
+        member.total_contributed += circle.contribution_amount;
         
         // 8. Save updated member info
         env.storage().instance().set(&member_key, &member);
@@ -656,29 +532,124 @@ impl SoroSusuTrait for SoroSusu {
         // 10. Update circle deadline for next cycle
         circle.deadline_timestamp = current_time + circle.cycle_duration;
         circle.contribution_bitmap |= 1 << member.index;
+
+        // Emit a health snapshot for indexers/frontends.
+        let active_members = circle.member_count as u32;
+        let contributed_members = core::cmp::min(circle.contribution_bitmap.count_ones(), active_members);
+        let missed_payments = active_members.saturating_sub(contributed_members);
+        let trust_score = if active_members == 0 {
+            0
+        } else {
+            (contributed_members * 100) / active_members
+        };
+
+        let health_update = GroupHealthUpdateEvent {
+            group_id: circle_id,
+            missed_payments,
+            active_members,
+            trust_score,
+        };
+        env.events()
+            .publish((Symbol::new(&env, "GROUP_HEALTH"), circle_id), health_update);
+
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
 
-    fn propose_trigger_insurance(env: Env, caller: Address, circle_id: u64, member: Address) -> u64 {
+    fn deposit_to_yield_pool(env: Env, caller: Address, circle_id: u64, amount: u64) {
         caller.require_auth();
-        
-        // Check if caller is admin (supports both legacy and multi-sig)
-        if !is_admin(&env, &caller) {
-            panic!("Unauthorized: Caller is not an admin");
+        if amount == 0 {
+            panic!("Amount must be greater than zero");
         }
-        
-        // Validate circle and member
-        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not initialized");
+        if caller != circle.creator && caller != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        let lending_pool: Address = env.storage().instance().get(&DataKey::LendingPool)
+            .unwrap_or_else(|| panic!("Lending pool not configured"));
+
+        let lending_client = LendingPoolClient::new(&env, &lending_pool);
+        lending_client.supply(
+            &circle.token,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        circle.yield_deposited += amount;
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn prepare_payout_liquidity(env: Env, caller: Address, circle_id: u64) {
+        caller.require_auth();
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not initialized");
+        if caller != circle.creator && caller != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        if circle.yield_deposited == 0 {
+            return;
+        }
+
+        let lending_pool: Address = env.storage().instance().get(&DataKey::LendingPool)
+            .unwrap_or_else(|| panic!("Lending pool not configured"));
+        let lending_client = LendingPoolClient::new(&env, &lending_pool);
+        lending_client.withdraw(
+            &circle.token,
+            &env.current_contract_address(),
+            &circle.yield_deposited,
+        );
+
+        circle.yield_deposited = 0;
+        if circle.pending_cycle_duration > 0 && current_time >= circle.duration_change_effective_at {
+            circle.cycle_duration = circle.pending_cycle_duration;
+            circle.pending_cycle_duration = 0;
+            circle.duration_change_effective_at = 0;
+        }
+        circle.deadline_timestamp = current_time + circle.cycle_duration;
+        circle.contribution_bitmap |= 1 << member.index;
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn trigger_insurance_coverage(env: Env, caller: Address, circle_id: u64, member: Address) {
+        caller.require_auth();
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+
+        // Only creator can trigger insurance
+        if caller != circle.creator {
+            panic!("Unauthorized: Only creator can trigger insurance");
+        }
+
+        // Check if insurance was already used this cycle
+        if circle.is_insurance_used {
+            panic!("Insurance already used this cycle");
+        }
+
+        // Check if there is enough balance
+        if circle.insurance_balance < circle.contribution_amount {
+            panic!("Insufficient insurance balance");
+        }
+
         let member_key = DataKey::Member(member.clone());
-        let member_info: Member = env.storage().instance().get(&member_key)
-            .unwrap_or_else(|| panic!("Member not found"));
-        
-        if !member_info.is_active {
-            panic!("Member is ejected");
+        let member_info: Member = env.storage().instance().get(&member_key).unwrap();
+
+        if member_info.status != MemberStatus::Active {
+            panic!("Member is not active");
         }
-        
-        // Create operation
-        create_operation(&env, 3, caller, Some(member), circle_id)
+
+        // Mark member as contributed in the bitmap
+        if (circle.contribution_bitmap & (1 << member_info.index)) != 0 {
+            panic!("Member already contributed");
+        }
+
+        circle.contribution_bitmap |= 1 << member_info.index;
+        circle.insurance_balance -= circle.contribution_amount;
+        circle.is_insurance_used = true;
+
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
 
     fn propose_penalty_change(env: Env, user: Address, circle_id: u64, new_bps: u32) {
@@ -692,6 +663,8 @@ impl SoroSusuTrait for SoroSusu {
 
         if !member.is_active {
             panic!("Member is ejected");
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
         }
 
         if new_bps > 10000 {
@@ -715,6 +688,27 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
 
+    fn propose_duration_change(env: Env, user: Address, circle_id: u64, new_duration: u64) {
+        user.require_auth();
+
+        if new_duration == 0 {
+            panic!("Duration must be greater than zero");
+        }
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let protocol_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not initialized");
+
+        if user != circle.creator && user != protocol_admin {
+            panic!("Unauthorized: Only admin can propose duration changes");
+        }
+
+        let current_time = env.ledger().timestamp();
+        circle.pending_cycle_duration = new_duration;
+        circle.duration_change_effective_at = current_time + DURATION_CHANGE_NOTICE_SECS;
+
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+
     fn vote_penalty_change(env: Env, user: Address, circle_id: u64) {
         user.require_auth();
 
@@ -724,8 +718,8 @@ impl SoroSusuTrait for SoroSusu {
         let member_key = DataKey::Member(user.clone());
         let member: Member = env.storage().instance().get(&member_key).expect("User is not a member");
 
-        if !member.is_active {
-            panic!("Member is ejected");
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
         }
 
         if circle.proposed_late_fee_bps == 0 {
@@ -743,70 +737,87 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
 
-    fn propose_eject_member(env: Env, caller: Address, circle_id: u64, member: Address) -> u64 {
+    fn eject_member(env: Env, caller: Address, circle_id: u64, member: Address) {
         caller.require_auth();
         
-        // Check if caller is admin (supports both legacy and multi-sig)
-        if !is_admin(&env, &caller) {
-            panic!("Unauthorized: Caller is not an admin");
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        
+        // Only creator can eject
+        if caller != circle.creator {
+            panic!("Unauthorized: Only creator can eject members");
         }
-        
-        // Validate member exists
+
         let member_key = DataKey::Member(member.clone());
-        let member_info: Member = env.storage().instance().get(&member_key)
-            .unwrap_or_else(|| panic!("Member not found"));
-        
-        if !member_info.is_active {
+        let mut member_info: Member = env.storage().instance().get(&member_key).expect("Member not found");
+
+        if member_info.status != MemberStatus::Active {
             panic!("Member already ejected");
         }
-        
-        // Create operation
-        create_operation(&env, 1, caller, Some(member), circle_id)
+
+        // Mark as ejected
+        member_info.status = MemberStatus::Ejected;
+        env.storage().instance().set(&member_key, &member_info);
+
+        // Burn NFT
+        let token_id = (circle_id as u128) << 64 | (member_info.index as u128);
+        let client = SusuNftClient::new(&env, &circle.nft_contract);
+        client.burn(&member, &token_id);
     }
 
-    fn propose_finalize_round(env: Env, caller: Address, circle_id: u64) -> u64 {
-        caller.require_auth();
-        
-        // Check if caller is admin (supports both legacy and multi-sig)
-        if !is_admin(&env, &caller) {
-            panic!("Unauthorized: Caller is not an admin");
-        }
-        
-        // Validate circle
+    fn request_exit(env: Env, user: Address, circle_id: u64) {
+        user.require_auth();
+
+        // Get the circle and member information
         let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"));
-        
-        // Check if round is already finalized
-        if circle.is_round_finalized {
-            panic!("Round is already finalized");
+
+        let member_key = DataKey::Member(user.clone());
+        let mut member: Member = env.storage().instance().get(&member_key)
+            .unwrap_or_else(|| panic!("User is not a member of this circle"));
+
+        // Check if member is active and can request exit
+        if member.status != MemberStatus::Active {
+            panic!("Member cannot request exit in current state");
         }
-        
-        // Create operation
-        create_operation(&env, 2, caller, None, circle_id)
+
+        // Change member status to AwaitingReplacement
+        member.status = MemberStatus::AwaitingReplacement;
+        env.storage().instance().set(&member_key, &member);
+
+        // Store the pending exit request
+        let pending_exit_key = DataKey::PendingExit(circle_id, user.clone());
+        env.storage().instance().set(&pending_exit_key, &true);
+
+        // Note: We keep the member's position in the queue locked until fill_vacancy is called
     }
 
-    fn claim_pot(env: Env, caller: Address, circle_id: u64) {
-        caller.require_auth();
+    fn fill_vacancy(env: Env, new_member: Address, circle_id: u64, exiting_member_address: Address) {
+        new_member.require_auth();
 
-        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        // Get the circle information
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
 
-        // Check if round is finalized
-        if !circle.is_round_finalized {
-            panic!("Round is not finalized");
+        // Verify there's a pending exit for the specified member
+        let pending_exit_key = DataKey::PendingExit(circle_id, exiting_member_address.clone());
+        if !env.storage().instance().has(&pending_exit_key) {
+            panic!("No pending exit found for specified member");
         }
 
-        // Check if caller is the designated recipient
-        if caller != circle.current_pot_recipient {
-            panic!("Caller is not the designated recipient");
+        // Get the exiting member's information
+        let exiting_member_key = DataKey::Member(exiting_member_address.clone());
+        let exiting_member: Member = env.storage().instance().get(&exiting_member_key)
+            .unwrap_or_else(|| panic!("Exiting member not found"));
+
+        if exiting_member.status != MemberStatus::AwaitingReplacement {
+            panic!("Exiting member is not in AwaitingReplacement state");
         }
 
-        // Check if the time buffer has passed
-        let scheduled_payout_time: u64 = env.storage().instance().get(&DataKey::ScheduledPayoutTime(circle_id))
-            .unwrap_or_else(|| panic!("No scheduled payout time found"));
-        
-        let current_time = env.ledger().timestamp();
-        if current_time < scheduled_payout_time {
-            panic!("Payout time has not arrived yet");
+        // Check if new member is already in any circle
+        let new_member_key = DataKey::Member(new_member.clone());
+        if env.storage().instance().has(&new_member_key) {
+            panic!("New member is already part of a circle");
         }
 
         // Calculate pot amount based on sum of current round contributions
@@ -823,25 +834,49 @@ impl SoroSusuTrait for SoroSusu {
         // Fallback to calculation if no individual contributions tracked (for backwards compatibility)
         if pot_amount == 0 {
             pot_amount = circle.contribution_amount * circle.member_count as u64;
+        // Calculate refund amount (pro-rata settlement: return only principal contributions)
+        let refund_amount = exiting_member.total_contributed;
+        // Calculate refund amount on the fly (principal only).
+        let refund_amount = exiting_member.contribution_count as u64 * circle.contribution_amount;
+
+        if refund_amount > 0 {
+            // Transfer refund to exiting member
+            let token_client = token::Client::new(&env, &circle.token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &exiting_member_address,
+                &refund_amount
+            );
         }
 
-        // Transfer the pot to the recipient
-        let token_client = token::Client::new(&env, &circle.token);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &caller,
-            &pot_amount
-        );
+        // Create new member with the same index as the exiting member
+        let replacement_member = Member {
+            address: new_member.clone(),
+            index: exiting_member.index, // Inherit the position in queue
+            contribution_count: 0,
+            last_contribution_time: 0,
+            status: MemberStatus::Active,
+            total_contributed: 0,
+        };
 
-        // Reset round state for next cycle
-        circle.is_round_finalized = false;
-        circle.current_pot_recipient = circle.creator.clone(); // Reset to creator
-        
-        // Clear scheduled payout time
-        env.storage().instance().remove(&DataKey::ScheduledPayoutTime(circle_id));
-        
-        // Save updated circle
-        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        // Store the new member
+        env.storage().instance().set(&new_member_key, &replacement_member);
+
+        // Update exiting member status to Ejected (effectively removed)
+        let mut updated_exiting_member = exiting_member;
+        updated_exiting_member.status = MemberStatus::Ejected;
+        env.storage().instance().set(&exiting_member_key, &updated_exiting_member);
+
+        // Remove the pending exit record
+        env.storage().instance().remove(&pending_exit_key);
+
+        // Burn the exiting member's NFT
+        let token_id = (circle_id as u128) << 64 | (exiting_member.index as u128);
+        let nft_client = SusuNftClient::new(&env, &circle.nft_contract);
+        nft_client.burn(&exiting_member_address, &token_id);
+
+        // Mint new NFT for the replacement member
+        nft_client.mint(&new_member, &token_id);
     }
 }
 
@@ -860,6 +895,15 @@ mod fuzz_tests {
     impl MockNft {
         pub fn mint(_env: Env, _to: Address, _id: u128) {}
         pub fn burn(_env: Env, _from: Address, _id: u128) {}
+    }
+
+    #[contract]
+    pub struct MockLendingPool;
+
+    #[contractimpl]
+    impl MockLendingPool {
+        pub fn supply(_env: Env, _token: Address, _from: Address, _amount: u64) {}
+        pub fn withdraw(_env: Env, _token: Address, _to: Address, _amount: u64) {}
     }
 
     #[derive(Arbitrary, Debug, Clone)]
@@ -1242,11 +1286,8 @@ mod fuzz_tests {
         circle.insurance_balance = 1000; 
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
 
-        // User 2 defaults. Creator proposes insurance trigger.
-        let operation_id = SoroSusuTrait::propose_trigger_insurance(env.clone(), creator.clone(), circle_id, user2.clone());
-        
-        // With legacy admin, threshold should be 1, so operation executes immediately
-        SoroSusuTrait::approve_operation(env.clone(), creator.clone(), operation_id);
+        // User 2 defaults. Creator triggers insurance.
+        SoroSusuTrait::trigger_insurance_coverage(env.clone(), creator.clone(), circle_id, user2.clone());
 
         let circle_after: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
         let member2_key = DataKey::Member(user2.clone());
@@ -1304,13 +1345,11 @@ mod fuzz_tests {
     }
 
     #[test]
-    fn test_delayed_pot_release() {
+    fn test_nft_membership() {
         let env = Env::default();
         let admin = Address::generate(&env);
         let creator = Address::generate(&env);
-        let user1 = Address::generate(&env);
-        let user2 = Address::generate(&env);
-        let user3 = Address::generate(&env);
+        let user = Address::generate(&env);
         let token = Address::generate(&env);
         let nft_contract = env.register_contract(None, MockNft);
 
@@ -1320,7 +1359,7 @@ mod fuzz_tests {
             env.clone(),
             creator.clone(),
             1000,
-            3,
+            5,
             token.clone(),
             604800,
             0,
@@ -1331,30 +1370,29 @@ mod fuzz_tests {
         SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id, 1);
         SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id, 1);
         SoroSusuTrait::join_circle(env.clone(), user3.clone(), circle_id);
+        // Join should trigger mint (mocked)
+        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
 
         env.mock_all_auths();
 
-        // All members deposit
-        SoroSusuTrait::deposit(env.clone(), user1.clone(), circle_id);
-        SoroSusuTrait::deposit(env.clone(), user2.clone(), circle_id);
-        SoroSusuTrait::deposit(env.clone(), user3.clone(), circle_id);
-
-        // Finalize the round (multi-sig)
-        let operation_id = SoroSusuTrait::propose_finalize_round(env.clone(), creator.clone(), circle_id);
-        // With legacy admin, threshold should be 1, so operation executes immediately
-        SoroSusuTrait::approve_operation(env.clone(), creator.clone(), operation_id);
+        // Verify member is active
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key).unwrap();
+        assert!(member.is_active);
+        assert_eq!(member.status, MemberStatus::Active);
 
         // Check that round is finalized and scheduled payout time is set
         let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
         assert!(circle.is_round_finalized);
         assert_eq!(circle.current_pot_recipient, user1); // First member should be recipient
+        // Eject member should trigger burn (mocked) and set inactive
+        SoroSusuTrait::eject_member(env.clone(), creator.clone(), circle_id, user.clone());
 
-        let scheduled_time: u64 = env.storage().instance().get(&DataKey::ScheduledPayoutTime(circle_id)).unwrap();
-        let current_time = env.ledger().timestamp();
-        assert!(scheduled_time > current_time);
-        assert_eq!(scheduled_time - current_time, 86400); // 24 hours
+        let member_after: Member = env.storage().instance().get(&member_key).unwrap();
+        assert!(!member_after.is_active);
+        assert_eq!(member_after.status, MemberStatus::Ejected);
 
-        // Try to claim before time buffer - should fail
+        // Inactive member cannot deposit
         let result = std::panic::catch_unwind(|| {
             SoroSusuTrait::claim_pot(env.clone(), user1.clone(), circle_id);
         });
@@ -1373,17 +1411,20 @@ mod fuzz_tests {
         let circle_after: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
         assert!(!circle_after.is_round_finalized);
         assert!(!env.storage().instance().has(&DataKey::ScheduledPayoutTime(circle_id)));
+            SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
+        });
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_finalize_round_requirements() {
+    fn test_deposit_to_yield_pool_and_prepare_liquidity() {
+    fn test_propose_duration_change_sets_72_hour_notice() {
         let env = Env::default();
         let admin = Address::generate(&env);
         let creator = Address::generate(&env);
-        let user1 = Address::generate(&env);
-        let user2 = Address::generate(&env);
         let token = Address::generate(&env);
         let nft_contract = env.register_contract(None, MockNft);
+        let lending_pool = env.register_contract(None, MockLendingPool);
 
         SoroSusuTrait::init(env.clone(), admin.clone());
 
@@ -1440,6 +1481,7 @@ mod fuzz_tests {
         let user2 = Address::generate(&env);
         let token = Address::generate(&env);
         let nft_contract = env.register_contract(None, MockNft);
+        SoroSusuTrait::set_lending_pool(env.clone(), admin.clone(), lending_pool.clone());
 
         SoroSusuTrait::init(env.clone(), admin.clone());
 
@@ -1447,7 +1489,7 @@ mod fuzz_tests {
             env.clone(),
             creator.clone(),
             1000,
-            2,
+            5,
             token.clone(),
             604800,
             0,
@@ -1459,16 +1501,9 @@ mod fuzz_tests {
 
         env.mock_all_auths();
 
-        // All members deposit and finalize
-        SoroSusuTrait::deposit(env.clone(), user1.clone(), circle_id);
-        SoroSusuTrait::deposit(env.clone(), user2.clone(), circle_id);
-        
-        // Finalize the round (multi-sig)
-        let operation_id = SoroSusuTrait::propose_finalize_round(env.clone(), creator.clone(), circle_id);
-        SoroSusuTrait::approve_operation(env.clone(), creator.clone(), operation_id);
-
-        // Advance time
-        env.ledger().set_timestamp(env.ledger().timestamp() + 86400);
+        SoroSusuTrait::deposit_to_yield_pool(env.clone(), creator.clone(), circle_id, 500);
+        let circle_after_supply: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        assert_eq!(circle_after_supply.yield_deposited, 500);
 
         // Non-recipient trying to claim should fail
         let result = std::panic::catch_unwind(|| {
@@ -1481,10 +1516,20 @@ mod fuzz_tests {
             SoroSusuTrait::claim_pot(env.clone(), user1.clone(), circle_id);
         });
         assert!(result.is_ok());
+        SoroSusuTrait::prepare_payout_liquidity(env.clone(), creator.clone(), circle_id);
+        let circle_after_withdraw: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        assert_eq!(circle_after_withdraw.yield_deposited, 0);
+        let now = env.ledger().timestamp();
+        SoroSusuTrait::propose_duration_change(env.clone(), creator.clone(), circle_id, 2_592_000);
+
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        assert_eq!(circle.cycle_duration, 604800);
+        assert_eq!(circle.pending_cycle_duration, 2_592_000);
+        assert_eq!(circle.duration_change_effective_at, now + DURATION_CHANGE_NOTICE_SECS);
     }
 
     #[test]
-    fn test_nft_membership() {
+    fn test_duration_change_activates_after_notice() {
         let env = Env::default();
         let admin = Address::generate(&env);
         let creator = Address::generate(&env);
@@ -1592,28 +1637,8 @@ mod fuzz_tests {
         SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
         
         // Test multi-sig eject member operation
+        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
         env.mock_all_auths();
-        
-        // Propose eject member
-        let operation_id = SoroSusuTrait::propose_eject_member(
-            env.clone(),
-            admin1.clone(),
-            circle_id,
-            user.clone(),
-        );
-        
-        // Should not be executed yet (only 1 approval, threshold is 2)
-        let member_key = DataKey::Member(user.clone());
-        let member: Member = env.storage().instance().get(&member_key).unwrap();
-        assert!(member.is_active);
-        
-        // Second admin approves
-        SoroSusuTrait::approve_operation(env.clone(), admin2.clone(), operation_id);
-        
-        // Now member should be ejected
-        let member_after: Member = env.storage().instance().get(&member_key).unwrap();
-        assert!(!member_after.is_active);
-    }
 
     #[test]
     fn test_legacy_admin_compatibility() {
@@ -1656,45 +1681,14 @@ mod fuzz_tests {
         let member: Member = env.storage().instance().get(&member_key).unwrap();
         assert!(!member.is_active);
     }
+        SoroSusuTrait::propose_duration_change(env.clone(), creator.clone(), circle_id, 2_592_000);
 
-    #[test]
-    fn test_admin_management_functions() {
-        let env = Env::default();
-        let admin1 = Address::generate(&env);
-        let admin2 = Address::generate(&env);
-        let admin3 = Address::generate(&env);
-        let new_admin = Address::generate(&env);
-        
-        // Initialize with 2 admins, threshold 2
-        let mut admin_list = Vec::new(&env);
-        admin_list.push_back(admin1.clone());
-        admin_list.push_back(admin2.clone());
-        
-        SoroSusuTrait::init_multi_sig_admin(env.clone(), admin_list, 2);
-        
-        env.mock_all_auths();
-        
-        // Add new admin
-        SoroSusuTrait::add_admin(env.clone(), admin1.clone(), new_admin.clone());
-        
-        let stored_admin_list: Vec<Address> = env.storage().instance()
-            .get(&DataKey::AdminList).unwrap();
-        assert_eq!(stored_admin_list.len(), 3);
-        
-        // Update threshold to 3
-        SoroSusuTrait::update_threshold(env.clone(), admin1.clone(), 3);
-        
-        let threshold: u32 = env.storage().instance()
-            .get(&DataKey::AdminThreshold).unwrap();
-        assert_eq!(threshold, 3);
-        
-        // Remove admin
-        SoroSusuTrait::remove_admin(env.clone(), admin1.clone(), admin2.clone());
-        
-        let final_admin_list: Vec<Address> = env.storage().instance()
-            .get(&DataKey::AdminList).unwrap();
-        assert_eq!(final_admin_list.len(), 2);
-    }
+        // Before the 72-hour notice elapses, old duration remains effective.
+        env.ledger().set_timestamp(env.ledger().timestamp() + DURATION_CHANGE_NOTICE_SECS - 1);
+        SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
+        let circle_before: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        assert_eq!(circle_before.cycle_duration, 604800);
+        assert_eq!(circle_before.pending_cycle_duration, 2_592_000);
 
     #[test]
     fn test_multi_sig_finalize_round() {
@@ -1749,7 +1743,12 @@ mod fuzz_tests {
         SoroSusuTrait::approve_operation(env.clone(), admin2.clone(), operation_id);
         
         // Now round should be finalized
+        // After notice elapses, next round scheduling picks up new duration.
+        env.ledger().set_timestamp(env.ledger().timestamp() + 2);
+        SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
         let circle_after: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-        assert!(circle_after.is_round_finalized);
+        assert_eq!(circle_after.cycle_duration, 2_592_000);
+        assert_eq!(circle_after.pending_cycle_duration, 0);
+        assert_eq!(circle_after.duration_change_effective_at, 0);
     }
 }
