@@ -3,6 +3,7 @@ use soroban_sdk::{contract, contracttype, contractimpl, contractclient, Address,
 
 // --- DATA STRUCTURES ---
 const YIELD_LIQUIDITY_BUFFER_SECS: u64 = 60 * 60;
+const DURATION_CHANGE_NOTICE_SECS: u64 = 72 * 60 * 60;
 
 #[contracttype]
 #[derive(Clone)]
@@ -52,6 +53,8 @@ pub struct CircleInfo {
     pub token: Address, // The token used (USDC, XLM)
     pub deadline_timestamp: u64, // Deadline for on-time payments
     pub cycle_duration: u64, // Duration of each payment cycle in seconds
+    pub pending_cycle_duration: u64,
+    pub duration_change_effective_at: u64,
     pub contribution_bitmap: u64,
     pub payout_bitmap: u64,
     pub insurance_balance: u64,
@@ -102,6 +105,9 @@ pub trait SoroSusuTrait {
 
     // Propose a change to the late fee penalty
     fn propose_penalty_change(env: Env, user: Address, circle_id: u64, new_bps: u32);
+
+    // Propose a change to the round duration (takes effect after 72 hours)
+    fn propose_duration_change(env: Env, user: Address, circle_id: u64, new_duration: u64);
 
     // Vote on the current proposal
     fn vote_penalty_change(env: Env, user: Address, circle_id: u64);
@@ -182,6 +188,8 @@ impl SoroSusuTrait for SoroSusu {
             token,
             deadline_timestamp: current_time + cycle_duration,
             cycle_duration,
+            pending_cycle_duration: 0,
+            duration_change_effective_at: 0,
             contribution_bitmap: 0,
             payout_bitmap: 0,
             insurance_balance: 0,
@@ -283,6 +291,7 @@ impl SoroSusuTrait for SoroSusu {
         let client = token::Client::new(&env, &circle.token);
 
         // 5. Check if payment is late and apply penalty if needed
+        let current_time = env.ledger().timestamp();
         let mut penalty_amount = 0u64;
 
         if current_time > circle.deadline_timestamp {
@@ -391,6 +400,13 @@ impl SoroSusuTrait for SoroSusu {
         );
 
         circle.yield_deposited = 0;
+        if circle.pending_cycle_duration > 0 && current_time >= circle.duration_change_effective_at {
+            circle.cycle_duration = circle.pending_cycle_duration;
+            circle.pending_cycle_duration = 0;
+            circle.duration_change_effective_at = 0;
+        }
+        circle.deadline_timestamp = current_time + circle.cycle_duration;
+        circle.contribution_bitmap |= 1 << member.index;
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
 
@@ -442,6 +458,8 @@ impl SoroSusuTrait for SoroSusu {
         let member_key = DataKey::Member(user.clone());
         let member: Member = env.storage().instance().get(&member_key).expect("User is not a member");
 
+        if !member.is_active {
+            panic!("Member is ejected");
         if member.status != MemberStatus::Active {
             panic!("Member is not active");
         }
@@ -463,6 +481,27 @@ impl SoroSusuTrait for SoroSusu {
             circle.proposed_late_fee_bps = 0;
             circle.proposal_votes_bitmap = 0;
         }
+
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn propose_duration_change(env: Env, user: Address, circle_id: u64, new_duration: u64) {
+        user.require_auth();
+
+        if new_duration == 0 {
+            panic!("Duration must be greater than zero");
+        }
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let protocol_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not initialized");
+
+        if user != circle.creator && user != protocol_admin {
+            panic!("Unauthorized: Only admin can propose duration changes");
+        }
+
+        let current_time = env.ledger().timestamp();
+        circle.pending_cycle_duration = new_duration;
+        circle.duration_change_effective_at = current_time + DURATION_CHANGE_NOTICE_SECS;
 
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
@@ -554,6 +593,7 @@ impl SoroSusuTrait for SoroSusu {
 
         // Get the circle information
         let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"));
 
         // Verify there's a pending exit for the specified member
@@ -579,6 +619,8 @@ impl SoroSusuTrait for SoroSusu {
 
         // Calculate refund amount (pro-rata settlement: return only principal contributions)
         let refund_amount = exiting_member.total_contributed;
+        // Calculate refund amount on the fly (principal only).
+        let refund_amount = exiting_member.contribution_count as u64 * circle.contribution_amount;
 
         if refund_amount > 0 {
             // Transfer refund to exiting member
@@ -1115,12 +1157,14 @@ mod fuzz_tests {
         // Verify member is active
         let member_key = DataKey::Member(user.clone());
         let member: Member = env.storage().instance().get(&member_key).unwrap();
+        assert!(member.is_active);
         assert_eq!(member.status, MemberStatus::Active);
 
         // Eject member should trigger burn (mocked) and set inactive
         SoroSusuTrait::eject_member(env.clone(), creator.clone(), circle_id, user.clone());
 
         let member_after: Member = env.storage().instance().get(&member_key).unwrap();
+        assert!(!member_after.is_active);
         assert_eq!(member_after.status, MemberStatus::Ejected);
 
         // Inactive member cannot deposit
@@ -1132,6 +1176,7 @@ mod fuzz_tests {
 
     #[test]
     fn test_deposit_to_yield_pool_and_prepare_liquidity() {
+    fn test_propose_duration_change_sets_72_hour_notice() {
         let env = Env::default();
         let admin = Address::generate(&env);
         let creator = Address::generate(&env);
@@ -1141,6 +1186,8 @@ mod fuzz_tests {
 
         SoroSusuTrait::init(env.clone(), admin.clone());
         SoroSusuTrait::set_lending_pool(env.clone(), admin.clone(), lending_pool.clone());
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
 
         let circle_id = SoroSusuTrait::create_circle(
             env.clone(),
@@ -1162,5 +1209,54 @@ mod fuzz_tests {
         SoroSusuTrait::prepare_payout_liquidity(env.clone(), creator.clone(), circle_id);
         let circle_after_withdraw: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
         assert_eq!(circle_after_withdraw.yield_deposited, 0);
+        let now = env.ledger().timestamp();
+        SoroSusuTrait::propose_duration_change(env.clone(), creator.clone(), circle_id, 2_592_000);
+
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        assert_eq!(circle.cycle_duration, 604800);
+        assert_eq!(circle.pending_cycle_duration, 2_592_000);
+        assert_eq!(circle.duration_change_effective_at, now + DURATION_CHANGE_NOTICE_SECS);
+    }
+
+    #[test]
+    fn test_duration_change_activates_after_notice() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let token = Address::generate(&env);
+        let nft_contract = env.register_contract(None, MockNft);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            0,
+            nft_contract.clone(),
+        );
+        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
+        env.mock_all_auths();
+
+        SoroSusuTrait::propose_duration_change(env.clone(), creator.clone(), circle_id, 2_592_000);
+
+        // Before the 72-hour notice elapses, old duration remains effective.
+        env.ledger().set_timestamp(env.ledger().timestamp() + DURATION_CHANGE_NOTICE_SECS - 1);
+        SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
+        let circle_before: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        assert_eq!(circle_before.cycle_duration, 604800);
+        assert_eq!(circle_before.pending_cycle_duration, 2_592_000);
+
+        // After notice elapses, next round scheduling picks up new duration.
+        env.ledger().set_timestamp(env.ledger().timestamp() + 2);
+        SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
+        let circle_after: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        assert_eq!(circle_after.cycle_duration, 2_592_000);
+        assert_eq!(circle_after.pending_cycle_duration, 0);
+        assert_eq!(circle_after.duration_change_effective_at, 0);
     }
 }
