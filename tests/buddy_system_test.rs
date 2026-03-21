@@ -1,42 +1,61 @@
-use soroban_sdk::{Env, Address, testutils::Address as _};
-use sorosusu_contracts::{SoroSusu, SoroSusuTrait};
+use soroban_sdk::{Env, Address, testutils::Address as _, contract, contractimpl, token};
+use sorosusu_contracts::{SoroSusu, SoroSusuClient, SoroSusuTrait};
+
+#[contract]
+pub struct MockNft;
+
+#[contractimpl]
+impl MockNft {
+    pub fn mint(_env: Env, _to: Address, _id: u128) {}
+    pub fn burn(_env: Env, _from: Address, _id: u128) {}
+}
 
 #[test]
 fn test_buddy_pairing() {
     let env = Env::default();
+    env.mock_all_auths();
+
     let admin = Address::generate(&env);
     let creator = Address::generate(&env);
     let user1 = Address::generate(&env);
     let user2 = Address::generate(&env);
-    let token = Address::generate(&env);
-    let nft_contract = Address::generate(&env);
+    
+    // Register mock token
+    let token_admin = Address::generate(&env);
+    let token = env.register_stellar_asset_contract(token_admin.clone());
+    
+    let nft_contract = env.register_contract(None, MockNft);
+
+    let contract_id = env.register_contract(None, SoroSusu);
+    let client = SoroSusuClient::new(&env, &contract_id);
 
     // Initialize contract
-    SoroSusuTrait::init(env.clone(), admin.clone());
+    client.init(&admin);
 
     // Create a circle
-    let circle_id = SoroSusuTrait::create_circle(
-        env.clone(),
-        creator.clone(),
-        1000,
-        5,
-        token.clone(),
-        604800,
-        0,
-        nft_contract.clone(),
+    let circle_id = client.create_circle(
+        &creator,
+        &1000,
+        &5,
+        &token,
+        &604800,
+        &0,
+        &nft_contract,
     );
 
     // Both users join the circle
-    SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id, 1);
-    SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id, 1);
-
-    env.mock_all_auths();
+    client.join_circle(&user1, &circle_id, &1, &None);
+    client.join_circle(&user2, &circle_id, &1, &None);
 
     // User1 pairs with User2 as buddy
-    SoroSusuTrait::pair_with_member(env.clone(), user1.clone(), user2.clone());
+    client.pair_with_member(&user1, &user2);
 
     // User2 sets safety deposit
-    SoroSusuTrait::set_safety_deposit(env.clone(), user2.clone(), circle_id, 2000);
+    // Need to mint tokens to user2 first
+    let token_client = token::StellarAssetClient::new(&env, &token);
+    token_client.mint(&user2, &5000);
+    
+    client.set_safety_deposit(&user2, &circle_id, &2000);
 
     println!("✅ Buddy system pairing and safety deposit test passed");
 }
@@ -44,43 +63,48 @@ fn test_buddy_pairing() {
 #[test]
 fn test_buddy_payment_fallback() {
     let env = Env::default();
+    env.mock_all_auths();
+
     let admin = Address::generate(&env);
     let creator = Address::generate(&env);
     let user1 = Address::generate(&env);
     let user2 = Address::generate(&env);
-    let token = Address::generate(&env);
-    let nft_contract = Address::generate(&env);
+    
+    // Register mock token
+    let token_admin = Address::generate(&env);
+    let token = env.register_stellar_asset_contract(token_admin.clone());
+    
+    let nft_contract = env.register_contract(None, MockNft);
+
+    let contract_id = env.register_contract(None, SoroSusu);
+    let client = SoroSusuClient::new(&env, &contract_id);
 
     // Initialize contract
-    SoroSusuTrait::init(env.clone(), admin.clone());
+    client.init(&admin);
 
     // Create a circle
-    let circle_id = SoroSusuTrait::create_circle(
-        env.clone(),
-        creator.clone(),
-        1000,
-        5,
-        token.clone(),
-        604800,
-        0,
-        nft_contract.clone(),
+    let circle_id = client.create_circle(
+        &creator,
+        &1000,
+        &5,
+        &token,
+        &604800,
+        &0,
+        &nft_contract,
     );
 
     // Both users join the circle
-    SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id, 1);
-    SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id, 1);
-
-    env.mock_all_auths();
+    client.join_circle(&user1, &circle_id, &1, &None);
+    client.join_circle(&user2, &circle_id, &1, &None);
 
     // User1 pairs with User2 as buddy
-    SoroSusuTrait::pair_with_member(env.clone(), user1.clone(), user2.clone());
+    client.pair_with_member(&user1, &user2);
 
     // User2 sets safety deposit (enough to cover user1's payment)
-    SoroSusuTrait::set_safety_deposit(env.clone(), user2.clone(), circle_id, 2000);
-
-    // Note: In a real test, we would simulate user1's payment failure
-    // and verify that buddy's safety deposit is used
-    // This requires more complex token mock setup
+    let token_client = token::StellarAssetClient::new(&env, &token);
+    token_client.mint(&user2, &5000);
+    
+    client.set_safety_deposit(&user2, &circle_id, &2000);
 
     println!("✅ Buddy payment fallback test structure created");
 }
