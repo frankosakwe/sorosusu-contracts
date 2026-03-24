@@ -1,6 +1,6 @@
 #![cfg(test)]
 use soroban_sdk::{testutils::Address as _, Address, Env, token, contract, contractimpl};
-use sorosusu_contracts::{SoroSusu, SoroSusuClient, SoroSusuTrait};
+use sorosusu_contracts::{SoroSusu, SoroSusuClient, SoroSusuTrait, Member, MemberStatus, DataKey};
 
 #[contract]
 pub struct MockNft;
@@ -52,6 +52,7 @@ fn test_full_rosca_cycle() {
         &cycle_duration,
         &100, // 1% insurance fee
         &nft_id,
+        &0, // min_reputation
     );
     
     // Join circle
@@ -71,4 +72,88 @@ fn test_full_rosca_cycle() {
     // For this test, let's assume it sets the recipient.
     
     println!("✅ Pipeline test completed successfully");
+}
+
+#[test]
+fn test_reputation_hash_below_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SoroSusu);
+    let client = SoroSusuClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    let user = Address::generate(&env);
+    let member = Member {
+        address: user.clone(),
+        index: 0,
+        contribution_count: 2,
+        last_contribution_time: 0,
+        status: MemberStatus::Active,
+        tier_multiplier: 1,
+        referrer: None,
+        buddy: None,
+    };
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Member(user.clone()), &member);
+    });
+
+    let result = client.try_compute_reputation_hash(&user, &3u32);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_reputation_hash_meets_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SoroSusu);
+    let client = SoroSusuClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    let user = Address::generate(&env);
+    let member = Member {
+        address: user.clone(),
+        index: 0,
+        contribution_count: 5,
+        last_contribution_time: 0,
+        status: MemberStatus::Active,
+        tier_multiplier: 1,
+        referrer: None,
+        buddy: None,
+    };
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Member(user.clone()), &member);
+    });
+
+    let hash = client.compute_reputation_hash(&user, &3u32);
+    assert!(hash.len() == 32);
+}
+
+#[test]
+fn test_verify_reputation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SoroSusu);
+    let client = SoroSusuClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    let user = Address::generate(&env);
+    let member = Member {
+        address: user.clone(),
+        index: 0,
+        contribution_count: 3,
+        last_contribution_time: 0,
+        status: MemberStatus::Active,
+        tier_multiplier: 1,
+        referrer: None,
+        buddy: None,
+    };
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Member(user.clone()), &member);
+    });
+
+    assert!(client.verify_reputation(&user, &3u32));
+    assert!(!client.verify_reputation(&user, &4u32));
 }
