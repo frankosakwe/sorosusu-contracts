@@ -47,6 +47,7 @@ fn test_reliability_score_oracle() {
     token_client.mint(&other_user, &10_000_000_000);
     
     let amount: i128 = 1000_000_000; // 100 units
+    let circle_id = client.create_circle(&user, &amount, &2, &token_id, &86400, &0, &nft_id, &0);
     let circle_id = client.create_circle(&user, &amount, &2, &token_id, &86400, &0, &nft_id);
     
     client.join_circle(&user, &circle_id, &1, &None);
@@ -108,6 +109,7 @@ fn test_badge_minting_after_long_cycle() {
     let amount: i128 = 500_000_000;
     let cycle_duration: u64 = 180 * 24 * 60 * 60; 
     let max_members = 2;
+    let circle_id = client.create_circle(&creator, &amount, &max_members, &token_id, &cycle_duration, &0, &nft_id, &0);
     let circle_id = client.create_circle(&creator, &amount, &max_members, &token_id, &cycle_duration, &0, &nft_id);
     
     let user1 = creator.clone();
@@ -133,4 +135,29 @@ fn test_badge_minting_after_long_cycle() {
     client.claim_pot(&user2, &circle_id);
     
     println!("Badge Minting Trigger Test Completed Successfully!");
+}
+
+#[test]
+#[should_panic(expected = "Insufficient reliability score")]
+fn test_reputation_gate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    
+    let contract_id = env.register_contract(None, SoroSusu);
+    let client = SoroSusuClient::new(&env, &contract_id);
+    client.init(&admin);
+    
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract(token_admin.clone());
+    let nft_id = env.register_contract(None, nft::MockNft);
+    
+    let amount: i128 = 1000_000_000;
+    // Require reputation score of 500
+    let circle_id = client.create_circle(&admin, &amount, &2, &token_id, &86400, &0, &nft_id, &500);
+    
+    // User has 0 score, should panic
+    client.join_circle(&user, &circle_id, &1, &None);
 }

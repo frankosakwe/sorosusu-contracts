@@ -326,8 +326,11 @@ pub struct CircleInfo {
     pub requires_collateral: bool,
     pub collateral_bps: u32,
     pub total_cycle_value: i128,
+    pub min_reputation: u32,
 }
 
+pub mod external_clients {
+    use super::*;
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct SuccessionProposal {
@@ -337,18 +340,25 @@ pub struct SuccessionProposal {
 
 // --- CONTRACT CLIENTS ---
 
-#[contractclient(name = "SusuNftClient")]
-pub trait SusuNftTrait {
-    fn mint(env: Env, to: Address, token_id: u128);
-    fn burn(env: Env, from: Address, token_id: u128);
+    #[contractclient(name = "SusuNftClient")]
+    pub trait SusuNftTrait {
+        fn mint(env: Env, to: Address, token_id: u128);
+        fn burn(env: Env, from: Address, token_id: u128);
+    }
+
+    #[contractclient(name = "LendingPoolClient")]
+    pub trait LendingPoolTrait {
+        fn supply(env: Env, token: Address, from: Address, amount: i128);
+        fn withdraw(env: Env, token: Address, to: Address, amount: i128);
+    }
+
+    #[contractclient(name = "BadgeClient")]
+    pub trait BadgeTrait {
+        fn mint(env: Env, to: Address, traits: Vec<Symbol>);
+    }
 }
 
-#[contractclient(name = "LendingPoolClient")]
-pub trait LendingPoolTrait {
-    fn supply(env: Env, token: Address, from: Address, amount: i128);
-    fn withdraw(env: Env, token: Address, to: Address, amount: i128);
-}
-
+pub use external_clients::{SusuNftClient, SusuNftTrait, LendingPoolClient, LendingPoolTrait, BadgeClient, BadgeTrait};
 #[contractclient(name = "BadgeClient")]
 pub trait BadgeTrait {
     fn mint(env: Env, to: Address, traits: Vec<Symbol>);
@@ -374,6 +384,7 @@ pub trait SoroSusuTrait {
         cycle_duration: u64,
         insurance_fee_bps: u32,
         nft_contract: Address,
+        min_reputation: u32,
     ) -> u64;
 
     fn join_circle(env: Env, user: Address, circle_id: u64, tier_multiplier: u32, referrer: Option<Address>);
@@ -605,6 +616,50 @@ fn next_active_member_index(env: &Env, circle: &CircleInfo, start_index: u32) ->
 #[contract]
 pub struct SoroSusu;
 
+impl SoroSusu {
+    // Internal helper for slashing collateral
+    fn _slash_collateral(env: Env, caller: Address, circle_id: u64, member: Address) {
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        
+        if caller != circle.creator && caller != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        let collateral_key = DataKey::CollateralVault(member.clone(), circle_id);
+        let mut collateral_info: CollateralInfo = env.storage().instance().get(&collateral_key)
+            .expect("Collateral not staked");
+
+        if collateral_info.status != CollateralStatus::Staked {
+            panic!("Collateral not available for slashing");
+        }
+
+        // Check if member is defaulted
+        let defaulted_key = DataKey::DefaultedMembers(circle_id);
+        let defaulted_members: Vec<Address> = env.storage().instance().get(&defaulted_key).unwrap_or(Vec::new(&env));
+        
+        if !defaulted_members.contains(&member) {
+            panic!("Member not defaulted");
+        }
+
+        // Slash the collateral - distribute to remaining active members
+        
+        let slash_amount = collateral_info.amount;
+        
+        // Transfer to group reserve for distribution
+        let mut reserve: i128 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
+        reserve += slash_amount;
+        env.storage().instance().set(&DataKey::GroupReserve, &reserve);
+
+        // Notify badge contract if necessary (optional future task)
+        // ...
+        
+        // Update collateral status
+        collateral_info.status = CollateralStatus::Slashed;
+        env.storage().instance().set(&collateral_key, &collateral_info);
+    }
+}
+
 #[contractimpl]
 impl SoroSusuTrait for SoroSusu {
     fn init(env: Env, admin: Address) {
@@ -684,6 +739,7 @@ impl SoroSusuTrait for SoroSusu {
         cycle_duration: u64,
         insurance_fee_bps: u32,
         nft_contract: Address,
+        min_reputation: u32,
     ) -> u64 {
         creator.require_auth();
 
@@ -767,6 +823,7 @@ impl SoroSusuTrait for SoroSusu {
             requires_collateral,
             collateral_bps,
             total_cycle_value,
+            min_reputation,
         };
 
         env.storage().instance().set(&DataKey::Circle(circle_count), &new_circle);
@@ -802,6 +859,13 @@ impl SoroSusuTrait for SoroSusu {
         }
 
         let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        
+        // Reputation Gate check
+        let user_score = Self::get_reliability_score(env.clone(), user.clone());
+        if user_score < circle.min_reputation {
+            panic!("Insufficient reliability score");
+        }
+
         if circle.member_count >= circle.max_members {
             panic!("Circle is full");
         }
@@ -1489,6 +1553,7 @@ impl SoroSusuTrait for SoroSusu {
 
     fn slash_collateral(env: Env, caller: Address, circle_id: u64, member: Address) {
         caller.require_auth();
+        Self::_slash_collateral(env, caller, circle_id, member);
         
         let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
@@ -2362,7 +2427,45 @@ impl SoroSusuTrait for SoroSusu {
         let collateral_key = DataKey::CollateralVault(member.clone(), circle_id);
         if let Some(_collateral) = env.storage().instance().get::<DataKey, CollateralInfo>(&collateral_key) {
             // Reuse slash_collateral logic
-            Self::slash_collateral(env, caller, circle_id, member);
+            Self::_slash_collateral(env, caller, circle_id, member);
         }
+    }
+
+    fn get_reliability_score(env: Env, user: Address) -> u32 {
+        let rep_key = DataKey::Reputation(user.clone());
+        let rep: Reputation = env.storage().instance().get(&rep_key).unwrap_or(Reputation {
+            cycles_completed: 0,
+            total_contributions: 0,
+            on_time_contributions: 0,
+            total_volume: 0,
+        });
+
+        if rep.total_contributions == 0 {
+            return 0;
+        }
+
+        // Weights:
+        // 40% - On-time contribution ratio
+        // 30% - Total cycles completed (capped at 10 cycles for max points)
+        // 30% - Total volume rotated (capped at 10,000 units for max points)
+
+        let on_time_ratio = (rep.on_time_contributions * 400) / rep.total_contributions;
+        
+        let cycles_score = if rep.cycles_completed >= 10 {
+            300
+        } else {
+            rep.cycles_completed * 30
+        };
+
+        // Assuming 7 decimals for volume normalization (e.g. 1000 XLM = 10,000,000,0 units)
+        // Max volume points at 10,000 XLM
+        let normalized_volume = (rep.total_volume / 1_000_000_0) as u32;
+        let volume_score = if normalized_volume >= 10000 {
+            300
+        } else {
+            (normalized_volume * 300) / 10000
+        };
+
+        on_time_ratio + cycles_score + volume_score
     }
 }

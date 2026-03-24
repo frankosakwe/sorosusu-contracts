@@ -78,6 +78,9 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
@@ -994,6 +997,14 @@
                               },
                               "val": {
                                 "u32": 2
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "min_reputation"
+                              },
+                              "val": {
+                                "u32": 0
                               }
                             },
                             {
@@ -2266,6 +2277,9 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
