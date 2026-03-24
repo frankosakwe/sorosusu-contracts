@@ -1,5 +1,7 @@
 #![no_std]
 use soroban_sdk::{
+    contract, contractclient, contracterror, contractimpl, contracttype, token,
+    Address, Env, Symbol, Vec,
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
     Address, Env, String, Symbol, Vec,
     contract, contractclient, contracterror, contractimpl, contracttype, token, Address, Env, Vec,
@@ -63,7 +65,7 @@ const QUADRATIC_MAJORITY: u32 = 60; // 60% supermajority for rule changes
 const MAX_VOTE_WEIGHT: u32 = 100; // Maximum quadratic vote weight
 const MIN_GROUP_SIZE_FOR_QUADRATIC: u32 = 10; // Enable quadratic voting for groups >= 10 members
 const DEFAULT_COLLATERAL_BPS: u32 = 2000; // 20%
-const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_0; // 1000 XLM (assuming 7 decimals)
+const HIGH_VALUE_THRESHOLD: i128 = 10_000_000_000; // 1000 XLM (assuming 7 decimals)
 
 // --- DATA STRUCTURES ---
 
@@ -86,6 +88,7 @@ pub enum DataKey {
     DefaultedMembers(u64),
     MemberAtIndex(u64, u32),
     Reputation(Address),
+    BadgeContract,
 }
 
 #[contracttype]
@@ -285,6 +288,7 @@ pub struct Member {
     pub address: Address,
     pub index: u32,
     pub contribution_count: u32,
+    pub on_time_count: u32,
     pub last_contribution_time: u64,
     pub status: MemberStatus,
     pub tier_multiplier: u32,
@@ -345,11 +349,17 @@ pub trait LendingPoolTrait {
     fn withdraw(env: Env, token: Address, to: Address, amount: i128);
 }
 
+#[contractclient(name = "BadgeClient")]
+pub trait BadgeTrait {
+    fn mint(env: Env, to: Address, traits: Vec<Symbol>);
+}
+
 // --- CONTRACT TRAIT ---
 
 pub trait SoroSusuTrait {
     fn init(env: Env, admin: Address);
     fn set_lending_pool(env: Env, admin: Address, pool: Address);
+    fn set_badge_contract(env: Env, admin: Address, badge: Address);
 
     fn flag_member_for_default(env: Env, caller: Address, circle_id: u64, member: Address);
     fn clear_global_blacklist(env: Env, admin: Address, member: Address);
@@ -613,6 +623,8 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&DataKey::LendingPool, &pool);
     }
 
+    fn set_badge_contract(env: Env, admin: Address, badge: Address) {
+        admin.require_auth();
 
         let stored_admin: Address = env
             .storage()
@@ -651,6 +663,7 @@ impl SoroSusuTrait for SoroSusu {
         if admin != stored_admin {
             panic!("Unauthorized");
         }
+        env.storage().instance().set(&DataKey::BadgeContract, &badge);
 
         env.storage().instance().remove(&DataKey::GlobalBlacklist(member));
     }
@@ -837,6 +850,7 @@ impl SoroSusuTrait for SoroSusu {
             address: user.clone(),
             index: circle.member_count,
             contribution_count: 0,
+            on_time_count: 0,
             last_contribution_time: 0,
             status: MemberStatus::Active,
             tier_multiplier,
@@ -1005,8 +1019,10 @@ impl SoroSusuTrait for SoroSusu {
         rep.total_volume += base_amount;
         if current_time <= circle.deadline_timestamp {
             rep.on_time_contributions += 1;
+            member.on_time_count += 1;
         }
         env.storage().instance().set(&rep_key, &rep);
+        env.storage().instance().set(&member_key, &member);
         circle.contribution_bitmap |= 1u64 << member_index;
 
         env.storage().instance().set(&member_key, &member);
@@ -1105,10 +1121,41 @@ impl SoroSusuTrait for SoroSusu {
             if member_info.contribution_count >= circle.max_members {
                 let rep_key = DataKey::Reputation(user.clone());
                 if let Some(mut rep) = env.storage().instance().get::<DataKey, Reputation>(&rep_key) {
-                    // Only increment once per cycle. We can check if it was already incremented if we want, but since they only claim pot once, it's fine.
-                    // Actually they might claim pot once but the check here might be triggered multiple times if claim_pot was called multiple times (but current logic prevents that)
+                    // Only increment once per cycle.
                     rep.cycles_completed += 1;
                     env.storage().instance().set(&rep_key, &rep);
+
+                    // Trigger NFT Badge if they finish a 12-month cycle with zero defaults
+                    let cycle_duration_total = (circle.max_members as u64) * circle.cycle_duration;
+                    let one_year_seconds: u64 = 12 * 30 * 86400; // 360 days (approx "12-month cycle")
+
+                    if cycle_duration_total >= one_year_seconds && member_info.status == MemberStatus::Active {
+                        if let Some(badge_contract) = env.storage().instance().get::<DataKey, Address>(&DataKey::BadgeContract) {
+                            let badge_client = BadgeClient::new(&env, &badge_contract);
+                            let mut traits: Vec<Symbol> = Vec::new(&env);
+                            
+                            // Volume Tier
+                            if circle.total_cycle_value >= 100_000_000_0 { // 1000 units
+                                traits.push_back(Symbol::new(&env, "Volume_High"));
+                            } else if circle.total_cycle_value >= 20_000_000_0 { // 200 units
+                                traits.push_back(Symbol::new(&env, "Volume_Med"));
+                            } else {
+                                traits.push_back(Symbol::new(&env, "Volume_Low"));
+                            }
+                            
+                            // Perfect Attendance
+                            if member_info.on_time_count == circle.max_members {
+                                traits.push_back(Symbol::new(&env, "PerfectAttendance"));
+                            }
+                            
+                            // Group Lead
+                            if user == circle.creator {
+                                traits.push_back(Symbol::new(&env, "GroupLead"));
+                            }
+                            
+                            badge_client.mint(&user, &traits);
+                        }
+                    }
                 }
             }
         }
@@ -1470,18 +1517,14 @@ impl SoroSusuTrait for SoroSusu {
         let token_client = token::Client::new(&env, &circle.token);
         let slash_amount = collateral_info.amount;
         
-        // Get active members (excluding defaulted member)
-        let mut active_members: Vec<Address> = Vec::new(&env);
-        for i in 0..circle.max_members {
-            // This is a simplified approach - in practice, you'd want to store member addresses more efficiently
-            // For now, we'll distribute to group reserve
-        }
-        
         // Transfer to group reserve for distribution
         let mut reserve: i128 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
         reserve += slash_amount;
         env.storage().instance().set(&DataKey::GroupReserve, &reserve);
 
+        // Notify badge contract if necessary (optional future task)
+        // ...
+        
         // Update collateral status
         collateral_info.status = CollateralStatus::Slashed;
         env.storage().instance().set(&collateral_key, &collateral_info);
