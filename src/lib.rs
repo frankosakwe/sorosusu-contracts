@@ -2547,4 +2547,216 @@ impl SoroSusuTrait for SoroSusu {
         // For this example, we'll return a placeholder
         Address::generate(env)
     }
+
+    fn create_proposal(env: Env, proposer: Address, circle_id: u64, proposal_type: u32, description: String, voting_deadline: u64) -> u64 {
+        // 1. Authorization: The proposer must sign this transaction
+        proposer.require_auth();
+
+        // 2. Verify the circle exists and user is a member
+        let _circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle does not exist"));
+        
+        let member_key = DataKey::Member(proposer.clone());
+        let member: Member = env.storage().instance().get(&member_key)
+            .unwrap_or_else(|| panic!("User is not a member of this circle"));
+
+        // 3. Get proposal ID (increment counter)
+        let mut proposal_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
+        proposal_count += 1;
+
+        // 4. Calculate proposer's composite voting power
+        let proposer_reputation: u64 = env.storage().instance().get(&DataKey::UserReputation(proposer.clone())).unwrap_or(0);
+        
+        // Get current cycle contributions for this member
+        let private_key = DataKey::PrivateContribution(circle_id, proposer.clone());
+        let current_cycle_contrib: i128 = env.storage().instance().get(&private_key).unwrap_or(0);
+        
+        // Composite voting power = (reputation score * 10) + (current contributions / 1000) + base power
+        let reputation_power = proposer_reputation * 10; // Reputation has higher weight
+        let contribution_power = (current_cycle_contrib / 1000) as u64; // Scale down contributions
+        let base_power = 100; // Base voting power for all members
+        
+        let voting_power = reputation_power + contribution_power + base_power;
+
+        // 5. Create the proposal
+        let current_time = env.ledger().timestamp();
+        let proposal = VotingProposal {
+            id: proposal_count,
+            circle_id,
+            proposal_type,
+            description,
+            proposer: proposer.clone(),
+            created_at: current_time,
+            voting_deadline,
+            yes_votes: 0,
+            no_votes: 0,
+            total_voting_power: voting_power,
+            is_executed: false,
+        };
+
+        // 6. Store the proposal
+        env.storage().instance().set(&DataKey::VotingProposal(proposal_count), &proposal);
+
+        // 7. Emit proposal creation event
+        env.events().publish((Symbol::new(&env, "proposal_created"),), (proposal_count, circle_id, proposer, proposal_type));
+
+        // 8. Return proposal ID
+        proposal_count
+    }
+
+    fn vote(env: Env, voter: Address, proposal_id: u64, vote: bool) {
+        // 1. Authorization: The voter must sign this transaction
+        voter.require_auth();
+
+        // 2. Get the proposal
+        let mut proposal: VotingProposal = env.storage().instance().get(&DataKey::VotingProposal(proposal_id))
+            .unwrap_or_else(|| panic!("Proposal does not exist"));
+
+        // 3. Check if voting is still open
+        let current_time = env.ledger().timestamp();
+        if current_time > proposal.voting_deadline {
+            panic!("Voting period has ended");
+        }
+
+        // 4. Check if user has already voted
+        let vote_key = DataKey::Vote(proposal_id, voter.clone());
+        if env.storage().instance().has(&vote_key) {
+            panic!("User has already voted on this proposal");
+        }
+
+        // 5. Calculate voter's composite voting power
+        let voter_reputation: u64 = env.storage().instance().get(&DataKey::UserReputation(voter.clone())).unwrap_or(0);
+        
+        // Get current cycle contributions for this voter
+        let private_key = DataKey::PrivateContribution(proposal.circle_id, voter.clone());
+        let current_cycle_contrib: i128 = env.storage().instance().get(&private_key).unwrap_or(0);
+        
+        // Composite voting power = (reputation score * 10) + (current contributions / 1000) + base power
+        let reputation_power = voter_reputation * 10; // Reputation has higher weight
+        let contribution_power = (current_cycle_contrib / 1000) as u64; // Scale down contributions
+        let base_power = 100; // Base voting power for all members
+        
+        let voting_power = reputation_power + contribution_power + base_power;
+
+        // 6. Record the vote
+        let vote_record = VoteCast {
+            proposal_id,
+            voter: voter.clone(),
+            vote,
+            voting_power,
+        };
+        env.storage().instance().set(&vote_key, &vote_record);
+
+        // 7. Update proposal vote counts
+        if vote {
+            proposal.yes_votes += voting_power;
+        } else {
+            proposal.no_votes += voting_power;
+        }
+        proposal.total_voting_power += voting_power;
+
+        // 8. Save updated proposal
+        env.storage().instance().set(&DataKey::VotingProposal(proposal_id), &proposal);
+
+        // 9. Emit vote event
+        env.events().publish((Symbol::new(&env, "vote_cast"),), (proposal_id, voter, vote, voting_power));
+    }
+
+    fn execute_proposal(env: Env, executor: Address, proposal_id: u64) {
+        // 1. Authorization: The executor must sign this transaction
+        executor.require_auth();
+
+        // 2. Get the proposal
+        let mut proposal: VotingProposal = env.storage().instance().get(&DataKey::VotingProposal(proposal_id))
+            .unwrap_or_else(|| panic!("Proposal does not exist"));
+
+        // 3. Check if proposal has already been executed
+        if proposal.is_executed {
+            panic!("Proposal has already been executed");
+        }
+
+        // 4. Check if voting period has ended
+        let current_time = env.ledger().timestamp();
+        if current_time <= proposal.voting_deadline {
+            panic!("Voting period has not ended yet");
+        }
+
+        // 5. Check if proposal passed (simple majority)
+        if proposal.yes_votes <= proposal.no_votes {
+            panic!("Proposal did not pass");
+        }
+
+        // 6. Execute proposal based on type
+        match proposal.proposal_type {
+            0 => {
+                // Meeting date change - update circle deadline
+                let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(proposal.circle_id))
+                    .unwrap_or_else(|| panic!("Circle does not exist"));
+                
+                // Parse new deadline from description (simplified - in real implementation, 
+                // description would contain structured data)
+                let new_deadline = proposal.created_at + 7 * 24 * 3600; // Example: 7 days from proposal creation
+                circle.deadline_timestamp = new_deadline;
+                
+                env.storage().instance().set(&DataKey::Circle(proposal.circle_id), &circle);
+            },
+            1 => {
+                // New member admission - extract member address from description
+                // In real implementation, description would contain the new member address
+                // For now, this is a placeholder that would be implemented with proper parsing
+            },
+            _ => {
+                // Other proposal types - custom logic would go here
+            }
+        }
+
+        // 7. Mark proposal as executed
+        proposal.is_executed = true;
+        env.storage().instance().set(&DataKey::VotingProposal(proposal_id), &proposal);
+    }
+
+    fn update_reputation(env: Env, admin: Address, user: Address, reputation_score: u64) {
+        // 1. Authorization: The admin must sign this transaction
+        admin.require_auth();
+
+        // 2. Verify the caller is the admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("No admin set"));
+        
+        if stored_admin != admin {
+            panic!("Caller is not the admin");
+        }
+
+        // 3. Get current reputation for comparison
+        let current_reputation: u64 = env.storage().instance().get(&DataKey::UserReputation(user.clone())).unwrap_or(0);
+        
+        // 4. Update user reputation
+        env.storage().instance().set(&DataKey::UserReputation(user), &reputation_score);
+
+        // 5. Emit reputation update event
+        env.events().publish((Symbol::new(&env, "reputation_updated"),), (user, current_reputation, reputation_score, admin));
+        
+        // 6. If reputation was increased, check if user can now join higher-tier circles
+        if reputation_score > current_reputation {
+            env.events().publish((Symbol::new(&env, "reputation_upgraded"),), (user, current_reputation, reputation_score));
+        }
+    }
+
+    fn get_private_contribution(env: Env, user: Address, circle_id: u64, target_member: Address) -> i128 {
+        // 1. Authorization: The user must sign this transaction
+        user.require_auth();
+
+        // 2. Verify the user is a member of the circle
+        let member_key = DataKey::Member(user.clone());
+        let _member: Member = env.storage().instance().get(&member_key)
+            .unwrap_or_else(|| panic!("User is not a member of this circle"));
+
+        // 3. Get the private contribution amount
+        let contribution: i128 = env.storage().instance()
+            .get(&DataKey::PrivateContribution(circle_id, target_member))
+            .unwrap_or_else(|| panic!("Private contribution not found for target member"));
+
+        // 4. Return the contribution amount
+        contribution
+    }
 }
