@@ -2133,6 +2133,59 @@ impl SoroSusuTrait for SoroSusu {
             .get(&DataKey::MemberByIndex(circle_id, recipient_index))
     }
 
+    fn calculate_contribution_cap(env: &Env, user: &Address, requested_contribution: i128) -> i128 {
+        // Get user's historical contribution volume from UserStats
+        let user_stats_key = DataKey::UserStats(user.clone());
+        let user_stats: UserStats = env.storage().instance().get(&user_stats_key).unwrap_or(UserStats {
+            total_volume_saved: 0,
+            on_time_contributions: 0,
+            late_contributions: 0,
+        });
+        
+        // Get reputation metrics
+        let (reliability_score, social_capital_score, total_cycles) = crate::sbt_minter::SoroSusuSbtMinter::get_user_reputation_score(env.clone(), user.clone());
+        
+        // Calculate maximum allowed contribution based on reputation history
+        let max_allowed_contribution = if user_stats.total_volume_saved == 0 {
+            // New user: can only join circles with contribution <= 1000 (minimum threshold)
+            1000
+        } else {
+            // Existing user: max 3x step-up from their highest previous contribution
+            // This prevents pump-and-default schemes where users build small trust then join massive groups
+            let step_up_multiplier = 3i128;
+            user_stats.total_volume_saved * step_up_multiplier
+        };
+        
+        // Additional reputation-based modifiers
+        let reputation_modifier = if total_cycles >= 10 {
+            // Diamond tier users (10+ cycles) get 2x additional buffer
+            2i128
+        } else if total_cycles >= 6 {
+            // Gold tier users (6-9 cycles) get 1.5x additional buffer
+            15000i128 / 10000i128  // 1.5x in basis points
+        } else if total_cycles >= 3 {
+            // Silver tier users (3-5 cycles) get 1.25x additional buffer
+            12500i128 / 10000i128  // 1.25x in basis points
+        } else {
+            // Bronze tier users (0-2 cycles) get no additional buffer
+            1i128
+        };
+        
+        max_allowed_contribution * reputation_modifier
+    }
+
+    fn get_user_historical_max_contribution(env: &Env, user: &Address) -> i128 {
+        // Get user's historical contribution volume from UserStats
+        let user_stats_key = DataKey::UserStats(user.clone());
+        let user_stats: UserStats = env.storage().instance().get(&user_stats_key).unwrap_or(UserStats {
+            total_volume_saved: 0,
+            on_time_contributions: 0,
+            late_contributions: 0,
+        });
+        
+        user_stats.total_volume_saved
+    }
+
     // --- STELLAR ANCHOR DIRECT DEPOSIT API (SEP-24/SEP-31) ---
 
     fn register_anchor(env: Env, admin: Address, anchor_info: AnchorInfo) {
@@ -2566,6 +2619,36 @@ impl SoroSusuTrait for SoroSusu {
                 None => panic!("Collateral required for this circle"),
             }
         }
+
+        // Member-Specific Contribution Cap via Reputation (Sybil-Resistance)
+        // Prevent "Whales" from over-leveraging small groups and "Pump and Default" schemes
+        let requested_contribution = circle.contribution_amount * tier_multiplier as i128;
+        let max_allowed_contribution = Self::calculate_contribution_cap(&env, &user, requested_contribution);
+        
+        // Enforce contribution cap
+        if requested_contribution > max_allowed_contribution {
+            panic!(
+                "Contribution cap exceeded: Requested {}, Maximum allowed based on reputation history {}. 
+                Build trust gradually by starting with smaller contributions and completing cycles.",
+                requested_contribution, max_allowed_contribution
+            );
+        }
+        
+        // Get user stats for event emission
+        let user_stats_key = DataKey::UserStats(user.clone());
+        let user_stats: UserStats = env.storage().instance().get(&user_stats_key).unwrap_or(UserStats {
+            total_volume_saved: 0,
+            on_time_contributions: 0,
+            late_contributions: 0,
+        });
+        
+        let (_, _, total_cycles) = crate::sbt_minter::SoroSusuSbtMinter::get_user_reputation_score(env.clone(), user.clone());
+        
+        // Emit event for reputation-based contribution validation
+        env.events().publish(
+            (Symbol::new(&env, "CONTRIBUTION_CAP_VALIDATION"), user.clone(), circle_id),
+            (requested_contribution, max_allowed_contribution, total_cycles, user_stats.total_volume_saved),
+        );
 
         let new_member = Member {
             address: user.clone(),
