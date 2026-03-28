@@ -10,8 +10,6 @@
 // - Preventing "Social Engineering" or external harassment of winners
 // - Ensuring communal saving remains a safe and private activity
 
-#![no_std]
-
 use soroban_sdk::{contracttype, Env};
 
 // --- CONSTANTS ---
@@ -32,6 +30,7 @@ pub struct StealthConfig {
     pub enabled: bool,           // Whether stealth mode is enabled for this circle
     pub seed: u64,               // Current seed for RNG (regenerated each round)
     pub round_number: u32,       // Current round number (for seed derivation)
+    pub pending_winner: Option<u32>, // Winner index prepared but still hidden
     pub revealed_winner: Option<u32>, // Index of winner after reveal (None = not revealed)
 }
 
@@ -41,13 +40,13 @@ impl Default for StealthConfig {
             enabled: false,
             seed: 0,
             round_number: 0,
+            pending_winner: None,
             revealed_winner: None,
         }
     }
 }
 
 /// Storage key for the RNG state
-#[contracttype]
 #[derive(Clone)]
 pub struct RngState {
     pub state: [u32; MT_N],
@@ -67,9 +66,7 @@ impl Default for RngState {
 #[contracttype]
 #[derive(Clone)]
 pub enum StealthDataKey {
-    Config(u64),         // StealthConfig for a circle
-    RngState(u64),       // RngState for a circle
-    MemberList(u64),    // List of member indices for a circle
+    Config(u64), // StealthConfig for a circle
 }
 
 // --- MERSENNE TWISTER IMPLEMENTATION ---
@@ -85,7 +82,7 @@ pub fn mt_init(seed: u64) -> RngState {
     for i in 1..MT_N {
         // The magic formula from MT algorithm
         state[i] = (1812433253u32)
-            .wrapping_mul(state[i - 1].wrapping_xor(state[i - 1] >> 30))
+            .wrapping_mul(state[i - 1] ^ (state[i - 1] >> 30))
             .wrapping_add(i as u32);
     }
     
@@ -115,7 +112,7 @@ pub fn mt_next(env: &Env, rng: &mut RngState) -> u32 {
 }
 
 /// Reload the Mersenne Twister state array
-fn mt_reload(env: &Env, rng: &mut RngState) {
+fn mt_reload(_env: &Env, rng: &mut RngState) {
     // This is a simplified reload for Stellar's no_std environment
     // In production, you'd implement the full twist operation
     
@@ -161,10 +158,12 @@ pub fn mt_range(env: &Env, rng: &mut RngState, max: u32) -> u32 {
 /// Initialize stealth mode for a circle
 /// Called when creating a circle with stealth mode enabled
 pub fn init_stealth_mode(env: &Env, circle_id: u64, initial_seed: u64) {
+    let seed = derive_seed(initial_seed, 0);
     let config = StealthConfig {
         enabled: true,
-        seed: derive_seed(initial_seed, 0),
+        seed,
         round_number: 0,
+        pending_winner: None,
         revealed_winner: None,
     };
     
@@ -172,10 +171,6 @@ pub fn init_stealth_mode(env: &Env, circle_id: u64, initial_seed: u64) {
     let key = StealthDataKey::Config(circle_id);
     env.storage().instance().set(&key, &config);
     
-    // Initialize RNG state with seed
-    let rng_state = mt_init(derive_seed(initial_seed, 0));
-    let rng_key = StealthDataKey::RngState(circle_id);
-    env.storage().instance().set(&rng_key, &rng_state);
 }
 
 /// Derive a new seed from base seed and round number
@@ -192,6 +187,10 @@ fn derive_seed(base_seed: u64, round: u32) -> u64 {
 /// This should be called at the start of each round but the winner
 /// is not revealed until distribute_payout is called
 pub fn prepare_next_winner(env: &Env, circle_id: u64, member_count: u32) -> u32 {
+    if member_count == 0 {
+        return 0;
+    }
+
     let key = StealthDataKey::Config(circle_id);
     let mut config: StealthConfig = env.storage().instance()
         .get(&key)
@@ -199,7 +198,12 @@ pub fn prepare_next_winner(env: &Env, circle_id: u64, member_count: u32) -> u32 
     
     if !config.enabled {
         // Fall back to sequential if stealth mode not enabled
-        return config.round_number % member_count;
+        let sequential = config.round_number % member_count;
+        config.round_number += 1;
+        config.pending_winner = Some(sequential);
+        config.revealed_winner = None;
+        env.storage().instance().set(&key, &config);
+        return sequential;
     }
     
     // Increment round number
@@ -209,22 +213,19 @@ pub fn prepare_next_winner(env: &Env, circle_id: u64, member_count: u32) -> u32 
     config.seed = derive_seed(config.seed, config.round_number);
     
     // Initialize RNG with new seed
-    let rng_key = StealthDataKey::RngState(circle_id);
     let mut rng_state = mt_init(config.seed);
-    env.storage().instance().set(&rng_key, &rng_state);
     
     // Generate winner index
     let winner_index = mt_range(env, &mut rng_state, member_count);
     
     // Store winner secretly (not revealed yet)
-    config.revealed_winner = None; // Reset reveal state
+    config.pending_winner = Some(winner_index);
+    config.revealed_winner = None;
     
     // Save updated config
     env.storage().instance().set(&key, &config);
     
     // Save updated RNG state
-    env.storage().instance().set(&rng_key, &rng_state);
-    
     winner_index
 }
 
@@ -240,26 +241,17 @@ pub fn reveal_winner(env: &Env, circle_id: u64) -> Option<u32> {
         return None;
     }
     
-    // Get the winner from the current RNG state
-    let rng_key = StealthDataKey::RngState(circle_id);
-    let mut rng_state: RngState = env.storage().instance()
-        .get(&rng_key)
-        .unwrap_or_default();
-    
-    // The winner was already determined when prepare_next_winner was called
-    // We need to regenerate the same sequence to get the winner
-    // This is done by using the stored seed and re-running
-    
-    // For simplicity, we store the winner index directly when preparing
-    // In a more sophisticated implementation, you'd verify the RNG sequence
-    
-    // Mark as revealed and return current round number as "winner" 
-    // (the actual winner is determined by the sequential logic)
-    config.revealed_winner = Some(config.round_number % 10); // Placeholder
-    
-    env.storage().instance().set(&key, &config);
-    
-    Some(config.revealed_winner.unwrap())
+    if let Some(revealed) = config.revealed_winner {
+        return Some(revealed);
+    }
+
+    if let Some(pending) = config.pending_winner {
+        config.revealed_winner = Some(pending);
+        env.storage().instance().set(&key, &config);
+        return Some(pending);
+    }
+
+    None
 }
 
 /// Check if stealth mode is enabled for a circle
@@ -289,9 +281,21 @@ pub fn toggle_stealth_mode(env: &Env, circle_id: u64, enabled: bool, new_seed: u
     
     config.enabled = enabled;
     
-    if enabled && new_seed > 0 {
-        config.seed = new_seed;
+    if enabled {
+        config.seed = if new_seed > 0 {
+            derive_seed(new_seed, 0)
+        } else if config.seed > 0 {
+            config.seed
+        } else {
+            derive_seed(generate_random_seed(env), 0)
+        };
         config.round_number = 0;
+        config.pending_winner = None;
+        config.revealed_winner = None;
+
+    } else {
+        config.pending_winner = None;
+        config.revealed_winner = None;
     }
     
     env.storage().instance().set(&key, &config);
@@ -304,16 +308,14 @@ pub fn toggle_stealth_mode(env: &Env, circle_id: u64, enabled: bool, new_seed: u
 pub fn generate_random_seed(env: &Env) -> u64 {
     let timestamp = env.ledger().timestamp();
     let sequence = env.ledger().sequence();
-    let random = env.ledger().id().to_vec(); // Contract address as entropy
     
     // Mix entropy sources
     let mut seed = timestamp.wrapping_mul(0x5deece66d);
     seed = seed.wrapping_add(sequence as u64);
-    
-    // Add address bytes to entropy (take first 8 bytes)
-    for (i, byte) in random.iter().take(8).enumerate() {
-        seed = seed.wrapping_add((*byte as u64) << (i * 8));
-    }
+
+    // Mix in contract address length for deterministic per-contract variance.
+    let contract_addr_len = env.current_contract_address().to_string().len() as u64;
+    seed = seed.wrapping_add(contract_addr_len.wrapping_mul(0x9e3779b97f4a7c15));
     
     seed
 }
@@ -357,6 +359,26 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.seed, 0);
         assert_eq!(config.round_number, 0);
+        assert_eq!(config.pending_winner, None);
         assert_eq!(config.revealed_winner, None);
+    }
+
+    #[test]
+    fn test_prepare_and_reveal_winner() {
+        let env = Env::default();
+        init_stealth_mode(&env, 1, 9999);
+
+        let winner = prepare_next_winner(&env, 1, 5);
+        assert!(winner < 5);
+
+        let config_after_prepare = get_stealth_config(&env, 1);
+        assert_eq!(config_after_prepare.pending_winner, Some(winner));
+        assert_eq!(config_after_prepare.revealed_winner, None);
+
+        let revealed = reveal_winner(&env, 1);
+        assert_eq!(revealed, Some(winner));
+
+        let config_after_reveal = get_stealth_config(&env, 1);
+        assert_eq!(config_after_reveal.revealed_winner, Some(winner));
     }
 }
