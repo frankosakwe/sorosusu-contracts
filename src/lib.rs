@@ -4,12 +4,23 @@ use soroban_sdk::{
     Address, Env, String, Symbol, Vec,
 };
 
-// --- ERROR CODES ---
+    // NEW: Recursive Default Recovery functions
+    fn configure_default_recovery(env: Env, creator: Address, circle_id: u64, config: DefaultRecoveryConfig);
+    fn initiate_recovery_sprint(env: Env, admin: Address, circle_id: u64, defaulter: Address);
+    fn make_priority_claim(env: Env, claimant: Address, circle_id: u64, sprint_id: u64);
+    fn make_healthy_member_claim(env: Env, claimant: Address, circle_id: u64, sprint_id: u64);
+    fn get_recovery_sprint(env: Env, circle_id: u64, sprint_id: u64) -> Option<RecoverySprint>;
+    fn get_priority_claim(env: Env, claim_id: u64) -> Option<PriorityClaim>;
+    fn get_healthy_member_claim(env: Env, claim_id: u64) -> Option<HealthyMemberClaim>;
+    fn complete_recovery_sprint(env: Env, admin: Address, circle_id: u64, sprint_id: u64);
+    fn cancel_recovery_sprint(env: Env, admin: Address, circle_id: u64, sprint_id: u64);
+    fn initiate_debt_restructuring(env: Env, admin: Address, circle_id: u64, defaulter: Address, principal: i128, interest_rate_bps: u32);
+    fn get_debt_restructuring(env: Env, circle_id: u64, restructuring_id: u64) -> Option<InternalDebtRestructuring>;
+    fn make_restructuring_payment(env: Env, defaulter: Address, circle_id: u64, restructuring_id: u64, amount: i128);
+    fn complete_debt_restructuring(env: Env, admin: Address, circle_id: u64, restructuring_id: u64);
 
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum Error {
+    // Helper functions
+    // ... (rest of the code remains the same)
     Unauthorized = 1,
     MemberNotFound = 2,
     CircleFull = 3,
@@ -30,6 +41,12 @@ pub enum Error {
 }
 
 // --- CONSTANTS ---
+// Batch payout configuration
+const MIN_WINNERS_PER_ROUND: u16 = 1;
+const MAX_WINNERS_PER_ROUND: u16 = 10;
+const VALID_WINNER_COUNTS: [u16; 4] = [1, 2, 5, 10]; // Allowed winner counts
+const STROOP_PRECISION: i128 = 10_000_000; // 7 decimal places for Stellar
+
 const REFERRAL_DISCOUNT_BPS: u32 = 500; // 5%
 const RATE_LIMIT_SECONDS: u64 = 300; // 5 minutes
 const LENIENCY_GRACE_PERIOD: u64 = 172800; // 48 hours in seconds
@@ -1258,6 +1275,36 @@ impl SoroSusuTrait for SoroSusu {
                 None => panic!("Collateral required for this circle"),
             }
         }
+
+        // Member-Specific Contribution Cap via Reputation (Sybil-Resistance)
+        // Prevent "Whales" from over-leveraging small groups and "Pump and Default" schemes
+        let requested_contribution = circle.contribution_amount * tier_multiplier as i128;
+        let max_allowed_contribution = Self::calculate_contribution_cap(&env, &user, requested_contribution);
+        
+        // Enforce contribution cap
+        if requested_contribution > max_allowed_contribution {
+            panic!(
+                "Contribution cap exceeded: Requested {}, Maximum allowed based on reputation history {}. 
+                Build trust gradually by starting with smaller contributions and completing cycles.",
+                requested_contribution, max_allowed_contribution
+            );
+        }
+        
+        // Get user stats for event emission
+        let user_stats_key = DataKey::UserStats(user.clone());
+        let user_stats: UserStats = env.storage().instance().get(&user_stats_key).unwrap_or(UserStats {
+            total_volume_saved: 0,
+            on_time_contributions: 0,
+            late_contributions: 0,
+        });
+        
+        let (_, _, total_cycles) = crate::sbt_minter::SoroSusuSbtMinter::get_user_reputation_score(env.clone(), user.clone());
+        
+        // Emit event for reputation-based contribution validation
+        env.events().publish(
+            (Symbol::new(&env, "CONTRIBUTION_CAP_VALIDATION"), user.clone(), circle_id),
+            (requested_contribution, max_allowed_contribution, total_cycles, user_stats.total_volume_saved),
+        );
 
         let new_member = Member {
             address: user.clone(),
