@@ -22,7 +22,7 @@ def test_milestone_constants():
         "RELIABILITY_STAR_BONUS": 30
     }
     
-    print("✓ All milestone constants defined correctly")
+    print("[OK] All milestone constants defined correctly")
     return True
 
 def test_milestone_types():
@@ -40,7 +40,7 @@ def test_milestone_types():
         "ReliabilityStar"
     ]
     
-    print(f"✓ {len(milestone_types)} milestone types defined")
+    print(f"[OK] {len(milestone_types)} milestone types defined")
     return True
 
 def test_milestone_logic():
@@ -72,7 +72,7 @@ def test_milestone_logic():
         actual_bonus = get_consecutive_bonus(progress)
         assert actual_bonus == expected_bonus, f"Progress {progress}: expected {expected_bonus}, got {actual_bonus}"
     
-    print("✓ Consecutive payment bonus logic correct")
+    print("[OK] Consecutive payment bonus logic correct")
     
     # Test other milestone types (single achievement)
     single_achievements = {
@@ -88,7 +88,7 @@ def test_milestone_logic():
     for milestone, bonus in single_achievements.items():
         assert bonus > 0, f"{milestone} should have positive bonus"
     
-    print("✓ Single achievement milestones have correct bonuses")
+    print("[OK] Single achievement milestones have correct bonuses")
     return True
 
 def test_reputation_integration():
@@ -111,7 +111,7 @@ def test_reputation_integration():
     expected_final = min(50 + 10 + 15 + 20 + 18, 100)
     assert final_score == expected_final, f"Expected {expected_final}, got {final_score}"
     
-    print(f"✓ User journey: {base_trust_score} -> {final_score} (boost: +{total_boost})")
+    print(f"[OK] User journey: {base_trust_score} -> {final_score} (boost: +{total_boost})")
     return True
 
 def test_gamification_elements():
@@ -138,12 +138,12 @@ def test_gamification_elements():
         ("Vouching Champion", 5, 12),     # Trust building
     ]
     
-    print(f"✓ {len(short_term_wins)} short-term wins for immediate engagement")
-    print(f"✓ {len(long_term_rewards)} long-term rewards for retention")
+    print(f"[OK] {len(short_term_wins)} short-term wins for immediate engagement")
+    print(f"[OK] {len(long_term_rewards)} long-term rewards for retention")
     
     # Verify total possible boost points
     total_possible = sum(bonus for _, _, bonus in short_term_wins + long_term_rewards) + 40  # Max consecutive
-    print(f"✓ Total possible reputation boost: +{total_possible} points")
+    print(f"[OK] Total possible reputation boost: +{total_possible} points")
     
     return True
 
@@ -159,7 +159,7 @@ def test_storage_keys():
     
     # Each user should have per-circle milestone tracking
     # Each circle should have global statistics
-    print("✓ Storage keys support per-user and per-circle tracking")
+    print("[OK] Storage keys support per-user and per-circle tracking")
     return True
 
 def test_integration_points():
@@ -174,7 +174,7 @@ def test_integration_points():
     ]
     
     for function, integration in integration_points:
-        print(f"✓ {function} integrates with {integration}")
+        print(f"[OK] {function} integrates with {integration}")
     
     return True
 
@@ -203,26 +203,26 @@ def run_all_tests():
                 passed += 1
             else:
                 failed += 1
-                print(f"✗ {test.__name__} failed")
+                print(f"[FAIL] {test.__name__} failed")
         except Exception as e:
             failed += 1
-            print(f"✗ {test.__name__} failed: {e}")
+            print(f"[FAIL] {test.__name__} failed: {e}")
     
     print("=" * 60)
     print(f"RESULTS: {passed} passed, {failed} failed")
     print("=" * 60)
     
     if failed == 0:
-        print("🎉 All tests passed! Milestone system implementation is ready.")
+        print("All tests passed! Milestone system implementation is ready.")
         print("\nKey features implemented:")
-        print("• 8 different milestone types")
-        print("• Tiered bonus system (5, 10, 12 consecutive payments)")
-        print("• Integration with existing reputation system")
-        print("• Gamification elements for user engagement")
-        print("• Proper storage and tracking mechanisms")
-        print("• Automatic milestone detection and awarding")
+        print("* 8 different milestone types")
+        print("* Tiered bonus system (5, 10, 12 consecutive payments)")
+        print("* Integration with existing reputation system")
+        print("* Gamification elements for user engagement")
+        print("* Proper storage and tracking mechanisms")
+        print("* Automatic milestone detection and awarding")
     else:
-        print("❌ Some tests failed. Please review the implementation.")
+        print("Some tests failed. Please review the implementation.")
     
     return failed == 0
 

@@ -1,8 +1,10 @@
-#![no_std]
-use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, Vec, Symbol, token, testutils::{Address as TestAddress, Arbitrary as TestArbitrary}, arbitrary::{Arbitrary, Unstructured}};
+use soroban_sdk::{contract, contracttype, contractimpl, contractclient, Address, Env, Vec, Symbol, String, symbol_short, token};
 
 // --- DATA STRUCTURES ---
 const TAX_WITHHOLDING_BPS: u64 = 1000; // 10%
+const MAX_QUERY_LIMIT: u32 = 100;
+const MINIMUM_VOTING_PARTICIPATION: u32 = 50;
+const SIMPLE_MAJORITY_THRESHOLD: u32 = 50;
 
 #[contracttype]
 #[derive(Clone)]
@@ -24,6 +26,14 @@ pub enum DataKey {
     // #228: Governance
     Stake(Address),
     GlobalFeeBP, // Basis points
+    AuditCount,
+    AuditEntry(u64),
+    AuditAll,
+    AuditByActor(Address),
+    AuditByResource(u64),
+    Deposit(u64, Address),
+    LeniencyStats(u64),
+    SocialCapital(Address, u64),
 }
 
 #[contracttype]
@@ -119,6 +129,17 @@ pub struct Proposal {
 
 #[contracttype]
 #[derive(Clone)]
+pub struct DurationProposal {
+    pub id: u64,
+    pub new_duration: u64,
+    pub votes_for: u32,
+    pub votes_against: u32,
+    pub end_time: u64,
+    pub is_active: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
 pub struct QuadraticVote {
     pub voter: Address,
     pub proposal_id: u64,
@@ -209,13 +230,18 @@ pub struct CircleInfo {
     pub id: u64,
     pub creator: Address,
     pub contribution_amount: u64, // Optimized from i128 to u64
-    pub max_members: u16, // Optimized from u32 to u16
-    pub member_count: u16, // Track count separately from Vec
-    pub current_recipient_index: u16, // Track by index instead of Address
+    pub max_members: u32,
+    pub member_count: u32, // Track count separately from Vec
+    pub current_recipient_index: u32, // Track by index instead of Address
     pub is_active: bool,
     pub token: Address, // The token used (USDC, XLM)
     pub deadline_timestamp: u64, // Deadline for on-time payments
     pub cycle_duration: u64, // Duration of each payment cycle in seconds
+    pub member_addresses: Vec<Address>,
+    pub recovery_votes_bitmap: u32,
+    pub recovery_old_address: Option<Address>,
+    pub recovery_new_address: Option<Address>,
+    pub grace_period_end: Option<u64>,
 }
 
 // --- CONTRACT CLIENTS ---
@@ -256,7 +282,7 @@ pub trait SoroSusuTrait {
     fn init(env: Env, admin: Address, global_fee: u32);
     
     // Create a new savings circle (#227: Creator must pay bond)
-    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, bond_amount: u64) -> u64;
+    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u32, token: Address, cycle_duration: u64, bond_amount: u64) -> u64;
 
     // Join an existing circle
     fn join_circle(env: Env, user: Address, circle_id: u64);
@@ -324,7 +350,7 @@ fn count_active_members(env: &Env, circle: &CircleInfo) -> u32 {
     let mut active_count = 0u32;
     for i in 0..circle.member_count {
         let member_address = circle.member_addresses.get(i).unwrap();
-        let key = DataKey::Member(member_address);
+        let key = DataKey::Member(circle.id, member_address);
         if let Some(member) = env.storage().instance().get::<DataKey, Member>(&key) {
             if member.status == MemberStatus::Active {
                 active_count += 1;
@@ -354,7 +380,7 @@ fn apply_recovery_if_consensus(env: &Env, actor: &Address, circle_id: u64, circl
         .clone()
         .unwrap_or_else(|| panic!("No recovery proposal"));
 
-    let old_member_key = DataKey::Member(old_address);
+    let old_member_key = DataKey::Member(circle_id, old_address);
     let mut old_member: Member = env
         .storage()
         .instance()
@@ -365,7 +391,7 @@ fn apply_recovery_if_consensus(env: &Env, actor: &Address, circle_id: u64, circl
         panic!("Only active members can be recovered");
     }
 
-    let new_member_key = DataKey::Member(new_address.clone());
+    let new_member_key = DataKey::Member(circle_id, new_address.clone());
     if env.storage().instance().has(&new_member_key) {
         panic!("New address is already a member");
     }
@@ -511,7 +537,7 @@ fn finalize_leniency_vote_internal(
 }
 
 fn execute_proposal_logic(env: &Env, proposal: &Proposal) {
-    let proposal_key = DataKey::Proposal(proposal.id);
+    let proposal_key = DataKey::Proposal(proposal.circle_id, proposal.id);
     let mut updated_proposal = proposal.clone();
     updated_proposal.status = ProposalStatus::Executed;
     env.storage().instance().set(&proposal_key, &updated_proposal);
@@ -533,11 +559,11 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&DataKey::GlobalFeeBP, &global_fee);
     }
 
-    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, bond_amount: u64) -> u64 {
+    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u32, token: Address, cycle_duration: u64, bond_amount: u64) -> u64 {
         // #227: Creator MUST pay a bond
         creator.require_auth();
         let client = token::Client::new(&env, &token);
-        client.transfer(&creator, &env.current_contract_address(), &bond_amount);
+        client.transfer(&creator, &env.current_contract_address(), &(bond_amount as i128));
         
         // 1. Get the current Circle Count
         let mut circle_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
@@ -558,6 +584,11 @@ impl SoroSusuTrait for SoroSusu {
             token,
             deadline_timestamp: current_time + cycle_duration,
             cycle_duration,
+            member_addresses: Vec::new(&env),
+            recovery_votes_bitmap: 0,
+            recovery_old_address: None,
+            recovery_new_address: None,
+            grace_period_end: None,
         };
 
         // 4. Save the Circle, Bond, and Count
@@ -595,13 +626,18 @@ impl SoroSusuTrait for SoroSusu {
         // 5. Create and store the new member
         let new_member = Member {
             address: user.clone(),
-            has_contributed: false,
+            index: circle.member_count,
             contribution_count: 0,
             last_contribution_time: 0,
+            status: MemberStatus::Active,
+            tier_multiplier: 1,
+            referrer: None,
+            buddy: None,
         };
         
         // 6. Store the member and update circle count
         env.storage().instance().set(&member_key, &new_member);
+        circle.member_addresses.push_back(user.clone());
         circle.member_count += 1;
         
         // 7. Save the updated circle back to storage
@@ -651,11 +687,10 @@ impl SoroSusuTrait for SoroSusu {
         client.transfer(
             &user, 
             &env.current_contract_address(), 
-            &total_deposit
+            &(total_deposit as i128)
         );
 
         // 7. Update member contribution info
-        member.has_contributed = true;
         member.contribution_count += rounds;
         member.last_contribution_time = current_time;
         
@@ -754,11 +789,9 @@ impl SoroSusuTrait for SoroSusu {
             panic!("Only admin can slash bond");
         }
 
-        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
         let bond_amount: u64 = env.storage().instance().get(&DataKey::Bond(circle_id)).unwrap_or(0);
         
         if bond_amount > 0 {
-            let client = token::Client::new(&env, &circle.token);
             // In a real scenario, we might distribute this to members.
             // For now, we move it to GroupReserve storage and potentially a reserve account.
             let mut reserve_balance: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
@@ -780,7 +813,7 @@ impl SoroSusuTrait for SoroSusu {
         
         if bond_amount > 0 {
             let client = token::Client::new(&env, &circle.token);
-            client.transfer(&env.current_contract_address(), &circle.creator, &bond_amount);
+            client.transfer(&env.current_contract_address(), &circle.creator, &(bond_amount as i128));
             env.storage().instance().remove(&DataKey::Bond(circle_id));
         }
     }
@@ -788,7 +821,7 @@ impl SoroSusuTrait for SoroSusu {
     fn stake_xlm(env: Env, user: Address, xlm_token: Address, amount: u64) {
         user.require_auth();
         let client = token::Client::new(&env, &xlm_token);
-        client.transfer(&user, &env.current_contract_address(), &amount);
+        client.transfer(&user, &env.current_contract_address(), &(amount as i128));
 
         let stake_key = DataKey::Stake(user.clone());
         let mut user_stake: u64 = env.storage().instance().get(&stake_key).unwrap_or(0);
@@ -807,7 +840,7 @@ impl SoroSusuTrait for SoroSusu {
 
         user_stake -= amount;
         let client = token::Client::new(&env, &xlm_token);
-        client.transfer(&env.current_contract_address(), &user, &amount);
+        client.transfer(&env.current_contract_address(), &user, &(amount as i128));
         
         if user_stake == 0 {
             env.storage().instance().remove(&stake_key);
