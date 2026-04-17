@@ -23,38 +23,7 @@
         }
       ]
     ],
-    [
-      [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
-              "function_name": "create_reputation_milestone",
-              "args": [
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                },
-                {
-                  "u32": 5
-                },
-                {
-                  "string": "Complete 5 cycles"
-                },
-                {
-                  "vec": [
-                    {
-                      "symbol": "Silver"
-                    }
-                  ]
-                }
-              ]
-            }
-          },
-          "sub_invocations": []
-        }
-      ]
-    ],
+    [],
     [],
     [],
     []
@@ -105,39 +74,6 @@
       [
         {
           "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "key": {
-              "ledger_key_nonce": {
-                "nonce": 5541220902715666415
-              }
-            },
-            "durability": "temporary"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-                "key": {
-                  "ledger_key_nonce": {
-                    "nonce": 5541220902715666415
-                  }
-                },
-                "durability": "temporary",
-                "val": "void"
-              }
-            },
-            "ext": "v0"
-          },
-          6311999
-        ]
-      ],
-      [
-        {
-          "contract_data": {
             "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
             "key": "ledger_key_contract_instance",
             "durability": "persistent"
@@ -162,30 +98,55 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "K"
+                              "symbol": "K1"
                             },
                             {
-                              "symbol": "MileCnt"
+                              "symbol": "Cred"
+                            },
+                            {
+                              "u64": 1
                             }
                           ]
                         },
                         "val": {
-                          "u64": 1
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
+                          "map": [
                             {
-                              "symbol": "K"
+                              "key": {
+                                "symbol": "metadata_uri"
+                              },
+                              "val": {
+                                "string": "uri"
+                              }
                             },
                             {
-                              "symbol": "SbtAdm"
+                              "key": {
+                                "symbol": "milestone_id"
+                              },
+                              "val": {
+                                "u64": 1
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "status"
+                              },
+                              "val": {
+                                "vec": [
+                                  {
+                                    "symbol": "Pathfinder"
+                                  }
+                                ]
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "user"
+                              },
+                              "val": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                              }
                             }
                           ]
-                        },
-                        "val": {
-                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                         }
                       },
                       {
@@ -195,7 +156,7 @@
                               "symbol": "K1"
                             },
                             {
-                              "symbol": "Mile"
+                              "symbol": "Mil"
                             },
                             {
                               "u64": 1
@@ -210,14 +171,6 @@
                               },
                               "val": {
                                 "string": "Complete 5 cycles"
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "is_completed"
-                              },
-                              "val": {
-                                "bool": false
                               }
                             },
                             {
@@ -238,104 +191,6 @@
                                     "symbol": "Silver"
                                   }
                                 ]
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "user"
-                              },
-                              "val": {
-                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                              }
-                            }
-                          ]
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "K1A"
-                            },
-                            {
-                              "symbol": "UCred"
-                            },
-                            {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "u128": {
-                            "hi": 0,
-                            "lo": 0
-                          }
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "K1U"
-                            },
-                            {
-                              "symbol": "Cred"
-                            },
-                            {
-                              "u128": {
-                                "hi": 0,
-                                "lo": 0
-                              }
-                            }
-                          ]
-                        },
-                        "val": {
-                          "map": [
-                            {
-                              "key": {
-                                "symbol": "issue_date"
-                              },
-                              "val": {
-                                "u64": 0
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "metadata_uri"
-                              },
-                              "val": {
-                                "string": "uri"
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "reputation_score"
-                              },
-                              "val": {
-                                "u32": 5000
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "status"
-                              },
-                              "val": {
-                                "vec": [
-                                  {
-                                    "symbol": "Pathfinder"
-                                  }
-                                ]
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "token_id"
-                              },
-                              "val": {
-                                "u128": {
-                                  "hi": 0,
-                                  "lo": 0
-                                }
                               }
                             },
                             {
@@ -549,14 +404,6 @@
                 },
                 {
                   "key": {
-                    "symbol": "is_completed"
-                  },
-                  "val": {
-                    "bool": false
-                  }
-                },
-                {
-                  "key": {
                     "symbol": "required_cycles"
                   },
                   "val": {
@@ -642,10 +489,7 @@
               }
             ],
             "data": {
-              "u128": {
-                "hi": 0,
-                "lo": 0
-              }
+              "u64": 1
             }
           }
         }
@@ -671,10 +515,7 @@
               }
             ],
             "data": {
-              "u128": {
-                "hi": 0,
-                "lo": 0
-              }
+              "u64": 1
             }
           }
         }
@@ -700,14 +541,6 @@
               "map": [
                 {
                   "key": {
-                    "symbol": "issue_date"
-                  },
-                  "val": {
-                    "u64": 0
-                  }
-                },
-                {
-                  "key": {
                     "symbol": "metadata_uri"
                   },
                   "val": {
@@ -716,10 +549,10 @@
                 },
                 {
                   "key": {
-                    "symbol": "reputation_score"
+                    "symbol": "milestone_id"
                   },
                   "val": {
-                    "u32": 5000
+                    "u64": 1
                   }
                 },
                 {
@@ -732,17 +565,6 @@
                         "symbol": "Pathfinder"
                       }
                     ]
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "token_id"
-                  },
-                  "val": {
-                    "u128": {
-                      "hi": 0,
-                      "lo": 0
-                    }
                   }
                 },
                 {

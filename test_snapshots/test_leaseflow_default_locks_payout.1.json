@@ -842,7 +842,7 @@
                           "symbol": "AudCnt"
                         },
                         "val": {
-                          "u64": 3
+                          "u64": 2
                         }
                       },
                       {
@@ -986,69 +986,6 @@
                                 "symbol": "actor"
                               },
                               "val": {
-                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "id"
-                              },
-                              "val": {
-                                "u64": 2
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "resource_id"
-                              },
-                              "val": {
-                                "u64": 1
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "timestamp"
-                              },
-                              "val": {
-                                "u64": 0
-                              }
-                            }
-                          ]
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "K1"
-                            },
-                            {
-                              "symbol": "AudE"
-                            },
-                            {
-                              "u64": 3
-                            }
-                          ]
-                        },
-                        "val": {
-                          "map": [
-                            {
-                              "key": {
-                                "symbol": "action"
-                              },
-                              "val": {
-                                "vec": [
-                                  {
-                                    "symbol": "AdminAction"
-                                  }
-                                ]
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "actor"
-                              },
-                              "val": {
                                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                               }
                             },
@@ -1057,7 +994,7 @@
                                 "symbol": "id"
                               },
                               "val": {
-                                "u64": 3
+                                "u64": 2
                               }
                             },
                             {
@@ -1143,7 +1080,7 @@
                                 "symbol": "current_recipient_index"
                               },
                               "val": {
-                                "u32": 0
+                                "u32": 1
                               }
                             },
                             {

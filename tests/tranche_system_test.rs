@@ -44,7 +44,7 @@ fn setup_test_env() -> (Env, SoroSusuClient<'static>, Address, Address, Address,
     let token_address = env.register_contract(None, MockToken);
     
     // Create circle
-    let circle_id = client.create_circle(&circle_creator, &1_000_000i128, &3u32, &token_address, &86400u64, &0i128);
+    let circle_id = client.create_circle(&circle_creator, &1_000_000i128, &4u32, &token_address, &86400u64, &0i128);
     
     (env, client, admin, circle_creator, member1, circle_id)
 }

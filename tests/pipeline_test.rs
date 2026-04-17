@@ -47,7 +47,7 @@ fn test_full_rosca_cycle() {
     // Create circle
     let contribution_amount: i128 = 1000;
     let cycle_duration: u64 = 86400; // 1 day
-    let circle_id = client.create_circle(&creator, &contribution_amount, &2u32, &token_id, &cycle_duration, &100i128);
+    let circle_id = client.create_circle(&creator, &contribution_amount, &3u32, &token_id, &cycle_duration, &100i128);
 
     // Join circle
     client.join_circle(&user1, &circle_id);

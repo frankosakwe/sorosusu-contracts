@@ -57,7 +57,7 @@ fn test_aml_sanctions_payout_gating() {
     
     // Create circle
     let amount = 1000i128;
-    let max_members = 2u32;
+    let max_members = 3u32;
     let circle_id = client.create_circle(&creator, &amount, &max_members, &token, &86400u64, &0i128);
     
     // Mint tokens
@@ -83,6 +83,6 @@ fn test_aml_sanctions_payout_gating() {
     
     // Verify payout is frozen
     let (frozen_amount, frozen_winner) = client.get_frozen_payout(&circle_id);
-    assert_eq!(frozen_amount, 2000); // 1000 * 2
+    assert_eq!(frozen_amount, 3000); // 1000 * 3 (creator + winner + other_member)
     assert_eq!(frozen_winner, Some(winner));
 }
