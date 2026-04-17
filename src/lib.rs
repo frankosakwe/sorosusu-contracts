@@ -347,7 +347,12 @@ impl SoroSusuTrait for SoroSusu {
     fn slash_bond(_env: Env, adm: Address, _cid: u64) { adm.require_auth(); }
     fn release_bond(_env: Env, adm: Address, _cid: u64) { adm.require_auth(); }
     fn pair_with_member(env: Env, u: Address, buddy: Address) { u.require_auth(); env.storage().instance().set(&DataKey::K1A(symbol_short!("Bud"), u.clone()), &buddy); Self::record_audit_logic(&env, u, AuditAction::AdminAction, 0); }
-    fn set_safety_deposit(env: Env, u: Address, _cid: u64, amt: i128) { u.require_auth(); env.storage().instance().set(&DataKey::K1A(symbol_short!("Safe"), u), &amt); }
+    fn set_safety_deposit(env: Env, u: Address, cid: u64, amt: i128) {
+        u.require_auth();
+        let c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap();
+        token::Client::new(&env, &c.token).transfer(&u, &env.current_contract_address(), &amt);
+        env.storage().instance().set(&DataKey::K1A(symbol_short!("Safe"), u), &amt);
+    }
     fn propose_address_change(env: Env, prop: Address, cid: u64, old: Address, new: Address) { prop.require_auth(); let mut c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap(); c.recovery_old_address = Some(old); c.recovery_new_address = Some(new); env.storage().instance().set(&DataKey::K1(symbol_short!("C"), cid), &c); }
     fn vote_for_recovery(env: Env, voter: Address, cid: u64) { voter.require_auth(); let mut c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap(); c.recovery_votes_bitmap |= 1; env.storage().instance().set(&DataKey::K1(symbol_short!("C"), cid), &c); }
     fn stake_xlm(_env: Env, u: Address, _tok: Address, _amt: i128) { u.require_auth(); }
