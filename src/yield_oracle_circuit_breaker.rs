@@ -188,8 +188,8 @@ impl YieldOracleCircuitBreaker {
         );
     }
     
-    /// Register an AMM/pool for monitoring
-    pub fn register_amm(env: Env, admin: Address, amm_address: Address, initial_metrics: HealthMetrics) {
+    /// Register a yield strategy for monitoring
+    pub fn register_yield_strategy(env: Env, admin: Address, strategy_address: Address, initial_metrics: HealthMetrics) {
         // Verify admin authorization
         let stored_admin: Address = env.storage().instance()
             .get(&CircuitBreakerDataKey::State)
@@ -199,38 +199,38 @@ impl YieldOracleCircuitBreaker {
             panic!("Unauthorized");
         }
         
-        // Register AMM
-        env.storage().instance().set(&CircuitBreakerDataKey::AMMRegistry(amm_address.clone()), &true);
+        // Register yield strategy
+        env.storage().instance().set(&CircuitBreakerDataKey::AMMRegistry(strategy_address.clone()), &true);
         
         // Store initial health metrics
-        env.storage().instance().set(&CircuitBreakerDataKey::HealthMetrics(amm_address), &initial_metrics);
+        env.storage().instance().set(&CircuitBreakerDataKey::HealthMetrics(strategy_address), &initial_metrics);
         
         env.events().publish(
-            (Symbol::new(&env, "amm_registered"),),
-            (amm_address, initial_metrics.is_healthy),
+            (Symbol::new(&env, "yield_strategy_registered"),),
+            (strategy_address, initial_metrics.is_healthy),
         );
     }
     
-    /// Update health metrics for a monitored AMM/pool
-    pub fn update_health_metrics(env: Env, amm_address: Address, metrics: HealthMetrics) {
-        // Verify AMM is registered
+    /// Update health metrics for a monitored yield strategy
+    pub fn update_health_metrics(env: Env, strategy_address: Address, metrics: HealthMetrics) {
+        // Verify strategy is registered
         let is_registered: bool = env.storage().instance()
-            .get(&CircuitBreakerDataKey::AMMRegistry(amm_address.clone()))
+            .get(&CircuitBreakerDataKey::AMMRegistry(strategy_address.clone()))
             .unwrap_or(false);
         
         if !is_registered {
-            panic!("AMM not registered for monitoring");
+            panic!("Yield strategy not registered for monitoring");
         }
         
         // Update metrics
-        env.storage().instance().set(&CircuitBreakerDataKey::HealthMetrics(amm_address.clone()), &metrics);
+        env.storage().instance().set(&CircuitBreakerDataKey::HealthMetrics(strategy_address.clone()), &metrics);
         
         // Check if circuit breaker should be triggered
-        Self::check_circuit_breaker_conditions(&env, &amm_address, &metrics);
+        Self::check_circuit_breaker_conditions(&env, &strategy_address, &metrics);
         
         env.events().publish(
             (Symbol::new(&env, "health_metrics_updated"),),
-            (amm_address, metrics.health_factor),
+            (strategy_address, metrics.health_factor),
         );
     }
     
@@ -301,12 +301,9 @@ impl YieldOracleCircuitBreaker {
         // 2. Transfer funds to the protected vault
         // 3. Update yield delegation status
         
-        // For now, we'll simulate the unwind
-        let token_client = token::Client::new(&env, &delegation.pool_address);
-        
-        // Transfer from AMM to protected vault
-        token_client.transfer(
-            &env.current_contract_address(),
+        // Use the abstract yield strategy interface for emergency withdrawal
+        let strategy_client = crate::YieldStrategyClient::new(&env, &delegation.strategy_address);
+        let yield_info = strategy_client.emergency_withdraw(
             &protected_vault,
             &total_amount,
         );
@@ -356,11 +353,11 @@ impl YieldOracleCircuitBreaker {
             .expect("Circuit breaker state not found")
     }
     
-    /// Get health metrics for a specific AMM
-    pub fn get_health_metrics(env: Env, amm_address: Address) -> HealthMetrics {
+    /// Get health metrics for a specific yield strategy
+    pub fn get_health_metrics(env: Env, strategy_address: Address) -> HealthMetrics {
         env.storage().instance()
-            .get(&CircuitBreakerDataKey::HealthMetrics(amm_address))
-            .expect("Health metrics not found for AMM")
+            .get(&CircuitBreakerDataKey::HealthMetrics(strategy_address))
+            .expect("Health metrics not found for yield strategy")
     }
     
     /// Get emergency unwind records

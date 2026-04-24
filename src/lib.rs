@@ -2,7 +2,18 @@
 #[cfg(test)] extern crate std;
 
 mod yield_oracle_circuit_breaker;
+mod yield_strategy_trait;
+
+#[cfg(test)]
+mod yield_strategy_tests;
+
 use yield_oracle_circuit_breaker::{YieldOracleCircuitBreaker, CircuitBreakerState, HealthMetrics};
+use yield_strategy_trait::{
+    YieldStrategyTrait, YieldStrategyClient, YieldStrategyConfig, YieldInfo, 
+    DepositParams, WithdrawalParams, YieldEstimate, RegisteredStrategy, StrategyType,
+    YieldStrategyRegistryKey, validate_deposit_amount, validate_withdrawal_params, 
+    calculate_estimated_yield
+};
 
 // --- DATA STRUCTURES ---
 
@@ -58,6 +69,12 @@ pub enum DataKey {
     GasBufferConfig(u64),  // Per-circle gas buffer config
     ProtocolConfig,
     ScheduledPayoutTime(u64),
+    YieldDelegation(u64),
+    YieldVote(u64, Address),
+    YieldPoolRegistry,
+    GroupTreasury(u64),
+    YieldStrategyRegistry, // Registry for yield strategies
+    ActiveYieldStrategy(u64), // Active strategy per circle
 }
 
 // --- CONTRACT TRAIT ---
@@ -248,6 +265,269 @@ pub struct LeniencyRequest {
     pub total_votes_cast: u32,
     pub extension_hours: u64,
     pub reason: String,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct DissolutionProposal {
+    pub circle_id: u64,
+    pub initiator: Address,
+    pub reason: String,
+    pub created_timestamp: u64,
+    pub voting_deadline: u64,
+    pub status: DissolutionStatus,
+    pub approve_votes: u32,
+    pub reject_votes: u32,
+    pub total_votes_cast: u32,
+    pub dissolution_timestamp: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct NetPosition {
+    pub member: Address,
+    pub circle_id: u64,
+    pub total_contributions: i128,
+    pub total_received: i128,
+    pub net_position: i128, // Positive = owed money, Negative = owed to group
+    pub collateral_staked: i128,
+    pub collateral_status: CollateralStatus,
+    pub has_received_pot: bool,
+    pub refund_claimed: bool,
+    pub default_marked: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RefundClaim {
+    pub member: Address,
+    pub circle_id: u64,
+    pub claim_timestamp: u64,
+    pub refund_amount: i128,
+    pub collateral_refunded: i128,
+    pub status: RefundStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RefundStatus {
+    Pending,
+    Processed,
+    Failed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RolloverVoteChoice {
+    For,
+    Against,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RolloverStatus {
+    NotInitiated,
+    Voting,
+    Approved,
+    Rejected,
+    Applied,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum YieldVoteChoice {
+    For,
+    Against,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum YieldDelegationStatus {
+    NotInitiated,
+    Voting,
+    Approved,
+    Rejected,
+    Active,
+    Completed,
+    Withdrawn,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum YieldPoolType {
+    StellarLiquidityPool,
+    RegulatedMoneyMarket,
+    StableYieldVault,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldDelegation {
+    pub circle_id: u64,
+    pub delegation_amount: i128,
+    pub strategy_address: Address, // Abstract yield strategy contract address
+    pub strategy_type: StrategyType, // Type of yield strategy
+    pub delegation_percentage: u32, // Percentage of pot to delegate
+    pub created_timestamp: u64,
+    pub status: YieldDelegationStatus,
+    pub voting_deadline: u64,
+    pub for_votes: u32,
+    pub against_votes: u32,
+    pub total_votes_cast: u32,
+    pub start_time: Option<u64>,
+    pub end_time: Option<u64>,
+    pub total_yield_earned: i128,
+    pub yield_distributed: i128,
+    pub last_compound_time: u64,
+    pub strategy_info: Option<YieldInfo>, // Current strategy state
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldVote {
+    pub voter: Address,
+    pub circle_id: u64,
+    pub vote_choice: YieldVoteChoice,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldPoolInfo {
+    pub pool_address: Address,
+    pub pool_type: YieldPoolType,
+    pub is_active: bool,
+    pub total_delegated: i128,
+    pub apy_bps: u32, // Annual Percentage Yield in basis points
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldDistribution {
+    pub circle_id: u64,
+    pub recipient_share: i128,
+    pub treasury_share: i128,
+    pub total_yield: i128,
+    pub distribution_time: u64,
+    pub round_number: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PathPaymentStatus {
+    Proposed,
+    Approved,
+    Executing,
+    Completed,
+    Failed,
+    Refunded,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PathPaymentVoteChoice {
+    For,
+    Against,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PathPayment {
+    pub circle_id: u64,
+    pub source_token: Address, // Token user sends (e.g., XLM)
+    pub target_token: Address, // Token circle requires (e.g., USDC)
+    pub source_amount: i128,
+    pub target_amount: i128, // Amount after swap
+    pub exchange_rate: i128, // Rate used (target_amount / source_amount * 1M)
+    pub slippage_bps: u32, // Actual slippage experienced
+    pub dex_address: Address, // DEX used for swap
+    pub path_payment: Address, // Stellar path payment used
+    pub created_timestamp: u64,
+    pub status: PathPaymentStatus,
+    pub voting_deadline: u64,
+    pub for_votes: u32,
+    pub against_votes: u32,
+    pub total_votes_cast: u32,
+    pub execution_timestamp: Option<u64>,
+    pub completion_timestamp: Option<u64>,
+    pub refund_amount: Option<i128>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PathPaymentVote {
+    pub voter: Address,
+    pub circle_id: u64,
+    pub vote_choice: PathPaymentVoteChoice,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SupportedToken {
+    pub token_address: Address,
+    pub token_symbol: String, // e.g., "XLM", "USDC", "USDT"
+    pub decimals: u32,
+    pub is_stable: bool,
+    pub is_active: bool,
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct DexInfo {
+    pub dex_address: Address,
+    pub dex_name: String,
+    pub supported_pairs: Vec<(Address, Address)>, // (source, target) pairs
+    pub is_trusted: bool,
+    pub is_active: bool,
+    pub last_updated: u64,
+}
+
+/// A single asset slot in a multi-asset basket with its allocation weight.
+#[contracttype]
+#[derive(Clone)]
+pub struct AssetWeight {
+    pub token: Address,
+    pub weight_bps: u32, // Allocation in basis points (e.g., 5000 = 50%)
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RolloverBonus {
+    pub circle_id: u64,
+    pub bonus_amount: i128,
+    pub fee_percentage: u32, // Percentage of platform fee to refund
+    pub created_timestamp: u64,
+    pub status: RolloverStatus,
+    pub voting_deadline: u64,
+    pub for_votes: u32,
+    pub against_votes: u32,
+    pub total_votes_cast: u32,
+    pub applied_cycle: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RolloverVote {
+    pub voter: Address,
+    pub circle_id: u64,
+    pub vote_choice: RolloverVoteChoice,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct DissolvedCircle {
+    pub circle_id: u64,
+    pub dissolution_timestamp: u64,
+    pub total_contributions: i128,
+    pub total_distributed: i128,
+    pub remaining_funds: i128,
+    pub total_members: u32,
+    pub refunded_members: u32,
+    pub defaulted_members: u32,
 }
 
 #[contracttype]
@@ -845,13 +1125,19 @@ pub trait SoroSusuTrait {
     fn get_late_fee_distribution(env: Env, circle_id: u64, round_number: u32) -> LateFeeDistribution;
     fn get_payment_timing_record(env: Env, circle_id: u64, round_number: u32, member: Address) -> PaymentTimingRecord;
     fn distribute_late_fees_with_priority(env: Env, circle_id: u64, round_number: u32);
-    fn propose_yield_delegation(env: Env, user: Address, circle_id: u64, delegation_percentage: u32, pool_address: Address, pool_type: YieldPoolType);
+    fn propose_yield_delegation(env: Env, user: Address, circle_id: u64, delegation_percentage: u32, strategy_address: Address, strategy_type: StrategyType);
     fn vote_yield_delegation(env: Env, user: Address, circle_id: u64, vote_choice: YieldVoteChoice);
     fn approve_yield_delegation(env: Env, circle_id: u64);
     fn execute_yield_delegation(env: Env, circle_id: u64);
     fn compound_yield(env: Env, circle_id: u64);
     fn withdraw_yield_delegation(env: Env, circle_id: u64);
     fn distribute_yield_earnings(env: Env, circle_id: u64);
+    
+    // Yield Strategy Registry Management
+    fn register_yield_strategy(env: Env, admin: Address, strategy_address: Address, strategy_type: StrategyType, config: YieldStrategyConfig);
+    fn get_registered_strategies(env: Env) -> Vec<RegisteredStrategy>;
+    fn set_default_yield_strategy(env: Env, admin: Address, strategy_address: Address);
+    fn get_default_yield_strategy(env: Env) -> Option<Address>;
 
     // Path Payment Contribution Support
     fn propose_path_payment_support(env: Env, user: Address, circle_id: u64);
@@ -3271,7 +3557,7 @@ impl SoroSusuTrait for SoroSusu {
         );
     }
 
-    fn propose_yield_delegation(env: Env, user: Address, circle_id: u64, delegation_percentage: u32, pool_address: Address, pool_type: YieldPoolType) {
+    fn propose_yield_delegation(env: Env, user: Address, circle_id: u64, delegation_percentage: u32, strategy_address: Address, strategy_type: StrategyType) {
         user.require_auth();
 
         if delegation_percentage > MAX_DELEGATION_PERCENTAGE {
@@ -3311,11 +3597,18 @@ impl SoroSusuTrait for SoroSusu {
             panic!("Delegation amount below minimum");
         }
 
+        // Validate the yield strategy before proposing
+        let strategy_client = YieldStrategyClient::new(&env, &strategy_address);
+        let strategy_info = strategy_client.get_strategy_info();
+        if !strategy_info.is_active {
+            panic!("Yield strategy is not active");
+        }
+
         let yield_delegation = YieldDelegation {
             circle_id,
             delegation_amount,
-            pool_address: pool_address.clone(),
-            pool_type: pool_type.clone(),
+            strategy_address: strategy_address.clone(),
+            strategy_type: strategy_type.clone(),
             delegation_percentage,
             created_timestamp: current_time,
             status: YieldDelegationStatus::Voting,
@@ -3328,6 +3621,7 @@ impl SoroSusuTrait for SoroSusu {
             total_yield_earned: 0,
             yield_distributed: 0,
             last_compound_time: current_time,
+            strategy_info: None,
         };
 
         env.storage().instance().set(&delegation_key, &yield_delegation);
@@ -3352,7 +3646,7 @@ impl SoroSusuTrait for SoroSusu {
 
         env.events().publish(
             (Symbol::new(&env, "YIELD_DELEGATION_PROPOSED"), circle_id, user.clone()),
-            (delegation_amount, delegation_percentage, pool_address, updated_delegation.voting_deadline),
+            (delegation_amount, delegation_percentage, strategy_address, updated_delegation.voting_deadline),
         );
     }
 
@@ -3410,25 +3704,13 @@ impl SoroSusuTrait for SoroSusu {
             circle.insurance_balance += insurance_fee;
         }
 
-        member.contribution_count += 1;
-        member.last_contribution_time = current_time;
-        circle.contribution_bitmap |= 1 << member.index;
+        // Get strategy info to validate it's active and get current APY
+        let strategy_client = YieldStrategyClient::new(&env, &delegation.strategy_address);
+        let strategy_info = strategy_client.get_strategy_info();
         
-        if !pool_registry.contains(&delegation.pool_address) {
-            pool_registry.push_back(delegation.pool_address.clone());
-            env.storage().instance().set(&pool_registry_key, &pool_registry);
+        if !strategy_info.is_active {
+            panic!("Yield strategy is not active");
         }
-
-        // Update pool info
-        let pool_info = YieldPoolInfo {
-            pool_address: delegation.pool_address.clone(),
-            pool_type: delegation.pool_type.clone(),
-            is_active: true,
-            total_delegated: delegation.delegation_amount,
-            apy_bps: 500, // Default 5% APY (would be fetched from pool)
-            last_updated: env.ledger().timestamp(),
-        };
-        env.storage().instance().set(&DataKey::YieldDelegation(circle_id), &pool_info);
 
         // Execute the delegation
         execute_yield_delegation_internal(&env, circle_id, &mut delegation);
@@ -3438,7 +3720,7 @@ impl SoroSusuTrait for SoroSusu {
 
         env.events().publish(
             (Symbol::new(&env, "YIELD_DELEGATION_APPROVED"), circle_id),
-            (delegation.delegation_amount, delegation.pool_address),
+            (delegation.delegation_amount, delegation.strategy_address),
         );
     }
 
@@ -3460,7 +3742,7 @@ impl SoroSusuTrait for SoroSusu {
 
         execute_yield_delegation_internal(&env, circle_id, &mut delegation);
         
-        // Register the AMM for circuit breaker monitoring
+        // Register the yield strategy for circuit breaker monitoring
         let initial_metrics = HealthMetrics {
             current_apy: 500, // Default 5% APY
             volatility_index: 1000, // Default 10% volatility
@@ -3471,13 +3753,13 @@ impl SoroSusuTrait for SoroSusu {
             is_healthy: true,
         };
         
-        YieldOracleCircuitBreaker::register_amm(&env, env.current_contract_address(), delegation.pool_address.clone(), initial_metrics);
+        YieldOracleCircuitBreaker::register_yield_strategy(&env, env.current_contract_address(), delegation.strategy_address.clone(), initial_metrics);
         
         env.storage().instance().set(&delegation_key, &delegation);
 
         env.events().publish(
             (Symbol::new(&env, "YIELD_DELEGATION_EXECUTED"), circle_id),
-            (delegation.delegation_amount, delegation.pool_address),
+            (delegation.delegation_amount, delegation.strategy_address),
         );
     }
 
@@ -3510,13 +3792,156 @@ impl SoroSusuTrait for SoroSusu {
         );
     }
 
-    fn finalize_round(env: Env, caller: Address, circle_id: u64) {
-        caller.require_auth();
-        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+    fn withdraw_yield_delegation(env: Env, circle_id: u64) {
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        let mut delegation: YieldDelegation = env.storage().instance().get(&delegation_key)
+            .expect("No yield delegation found");
+
+        if delegation.status != YieldDelegationStatus::Active {
+            panic!("Yield delegation is not active");
+        }
+
+        // Final compound before withdrawal
+        let current_time = env.ledger().timestamp();
+        let time_elapsed = current_time - delegation.last_compound_time;
+        let final_yield = calculate_yield_from_pool(&env, &delegation, time_elapsed);
+        delegation.total_yield_earned += final_yield;
+
+        // Withdraw from yield strategy using the abstract interface
+        let withdrawal_params = WithdrawalParams {
+            amount: delegation.delegation_amount + delegation.total_yield_earned,
+            force_withdrawal: false,
+            claim_yield_only: false,
+        };
         
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
-        if caller != circle.creator && caller != stored_admin {
+        let strategy_client = YieldStrategyClient::new(&env, &delegation.strategy_address);
+        let yield_info = strategy_client.withdraw(
+            &env.current_contract_address(),
+            &withdrawal_params,
+        );
+        
+        let total_withdrawn = yield_info.current_balance;
+
+        delegation.status = YieldDelegationStatus::Completed;
+        delegation.end_time = Some(current_time);
+
+        env.storage().instance().set(&delegation_key, &delegation);
+
+        // Distribute earnings
+        distribute_yield_earnings(env, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_DELEGATION_WITHDRAWN"), circle_id),
+            (total_withdrawn, delegation.total_yield_earned),
+        );
+    }
+
+    // --- YIELD STRATEGY REGISTRY MANAGEMENT ---
+
+    fn register_yield_strategy(env: Env, admin: Address, strategy_address: Address, strategy_type: StrategyType, config: YieldStrategyConfig) {
+        admin.require_auth();
+        
+        // Verify admin authorization
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        
+        if admin != stored_admin {
             panic!("Unauthorized");
+        }
+        
+        // Validate strategy before registration
+        let strategy_client = YieldStrategyClient::new(&env, &strategy_address);
+        if !strategy_client.health_check() {
+            panic!("Strategy health check failed");
+        }
+        
+        let registry_key = DataKey::YieldStrategyRegistry;
+        let mut registry: Vec<RegisteredStrategy> = env.storage().instance()
+            .get(&registry_key)
+            .unwrap_or(Vec::new(&env));
+        
+        // Check if strategy already registered
+        for existing in registry.iter() {
+            if existing.address == strategy_address {
+                panic!("Strategy already registered");
+            }
+        }
+        
+        // Register new strategy
+        let registered_strategy = RegisteredStrategy {
+            address: strategy_address.clone(),
+            strategy_type: strategy_type.clone(),
+            config: config.clone(),
+            registration_time: env.ledger().timestamp(),
+            is_active: true,
+        };
+        
+        registry.push_back(registered_strategy);
+        env.storage().instance().set(&registry_key, &registry);
+        
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_STRATEGY_REGISTERED"),),
+            (strategy_address, strategy_type),
+        );
+    }
+    
+    fn get_registered_strategies(env: Env) -> Vec<RegisteredStrategy> {
+        let registry_key = DataKey::YieldStrategyRegistry;
+        env.storage().instance()
+            .get(&registry_key)
+            .unwrap_or(Vec::new(&env))
+    }
+    
+    fn set_default_yield_strategy(env: Env, admin: Address, strategy_address: Address) {
+        admin.require_auth();
+        
+        // Verify admin authorization
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+        
+        // Verify strategy is registered
+        let registry_key = DataKey::YieldStrategyRegistry;
+        let registry: Vec<RegisteredStrategy> = env.storage().instance()
+            .get(&registry_key)
+            .unwrap_or(Vec::new(&env));
+        
+        let mut is_registered = false;
+        for strategy in registry.iter() {
+            if strategy.address == strategy_address && strategy.is_active {
+                is_registered = true;
+                break;
+            }
+        }
+        
+        if !is_registered {
+            panic!("Strategy not found or not active");
+        }
+        
+        env.storage().instance().set(&DataKey::ActiveYieldStrategy(0), &strategy_address);
+        
+        env.events().publish(
+            (Symbol::new(&env, "DEFAULT_YIELD_STRATEGY_SET"),),
+            (strategy_address,),
+        );
+    }
+    
+    fn get_default_yield_strategy(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::ActiveYieldStrategy(0))
+    }
+
+    fn distribute_yield_earnings(env: Env, circle_id: u64) {
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        let delegation: YieldDelegation = env.storage().instance().get(&delegation_key)
+            .expect("No yield delegation found");
+
+        if delegation.total_yield_earned <= delegation.yield_distributed {
+            panic!("No new yield to distribute");
         }
 
         if circle.is_round_finalized {
@@ -4119,8 +4544,305 @@ impl SoroSusuTrait for SoroSusu {
         }
     }
 
-    fn reputation_amnesty(env: Env, caller: Address, circle_id: u64, requester: Address) {
-        caller.require_auth();
+fn execute_yield_delegation_internal(env: &Env, circle_id: u64, delegation: &mut YieldDelegation) {
+    let current_time = env.ledger().timestamp();
+    
+    // Create deposit parameters for the yield strategy
+    let deposit_params = DepositParams {
+        amount: delegation.delegation_amount,
+        min_apy_bps: Some(100), // Minimum 1% APY
+        lockup_period: None,
+        auto_compound: true,
+    };
+    
+    // Execute deposit using the abstract yield strategy interface
+    let strategy_client = YieldStrategyClient::new(env, &delegation.strategy_address);
+    let yield_info = strategy_client.deposit(
+        &env.current_contract_address(),
+        &delegation.delegation_amount,
+        &deposit_params,
+    );
+    
+    // Update delegation with strategy info
+    delegation.status = YieldDelegationStatus::Active;
+    delegation.start_time = Some(current_time);
+    delegation.last_compound_time = current_time;
+    delegation.strategy_info = Some(yield_info);
+}
+
+fn calculate_yield_from_pool(env: &Env, delegation: &YieldDelegation, time_elapsed: u64) -> i128 {
+    // Use the abstract yield strategy interface to get estimated yield
+    let strategy_client = YieldStrategyClient::new(env, &delegation.strategy_address);
+    let yield_estimate = strategy_client.get_estimated_yield(
+        &delegation.delegation_amount,
+        &time_elapsed,
+    );
+    
+    yield_estimate.estimated_yield
+}
+
+    #[test]
+    fn test_get_reputation() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        // Test reputation for new user (should be zero/low)
+        let reputation = client.get_reputation(&user);
+        assert_eq!(reputation.susu_score, 0);
+        assert_eq!(reputation.reliability_score, 0);
+        assert_eq!(reputation.total_contributions, 0);
+        assert_eq!(reputation.on_time_rate, 0);
+        assert_eq!(reputation.volume_saved, 0);
+        assert_eq!(reputation.is_active, false);
+        
+        // Create circle and add user
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000,
+            &10,
+            &token_contract,
+            &86400,
+            &100, // 1%
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&user, &circle_id, &1, &None);
+        client.deposit(&user, &circle_id);
+        
+        // Test reputation after contribution
+        let reputation = client.get_reputation(&user);
+        assert!(reputation.susu_score > 0);
+        assert!(reputation.reliability_score > 0);
+        assert_eq!(reputation.total_contributions, 1);
+        assert_eq!(reputation.on_time_rate, 10000); // 100% on-time rate
+        assert_eq!(reputation.volume_saved, 1_000_000_000_000);
+        assert_eq!(reputation.is_active, true);
+    }
+
+    #[test]
+    fn test_credit_score_oracle() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        // Start out unscored
+        assert_eq!(client.get_user_reliability_score(&user), 0);
+
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000,
+            &10,
+            &token_contract,
+            &86400,
+            &100, // 1%
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&user, &circle_id, &1, &None);
+        client.deposit(&user, &circle_id);
+
+        // Should earn positive reliability
+        let score = client.get_user_reliability_score(&user);
+        assert!(score > 0);
+        
+        let stats = client.get_user_stats(&user);
+        assert_eq!(stats.on_time_contributions, 1);
+        assert_eq!(stats.late_contributions, 0);
+        assert_eq!(stats.total_volume_saved, 1_000_000_000_000);
+    }
+
+    #[test]
+    fn test_slash_user_credit() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        client.slash_user_credit(&admin, &user, &5);
+        let stats = client.get_user_stats(&user);
+        assert_eq!(stats.late_contributions, 5);
+        assert_eq!(client.get_user_reliability_score(&user), 0);
+    }
+
+    #[test]
+    fn test_cross_contract_oracle() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let oracle_id = env.register_contract(None, SoroSusu);
+        let oracle_client = SoroSusuClient::new(&env, &oracle_id);
+        
+        let lending_id = env.register_contract(None, MockLending);
+        let lending_client = MockLendingClient::new(&env, &lending_id);
+        
+        env.mock_all_auths();
+        oracle_client.init(&admin);
+        
+        // Start out unscored, cannot borrow
+        assert_eq!(lending_client.can_borrow(&oracle_id, &user), false);
+
+        let circle_id = oracle_client.create_circle(
+            &creator,
+            &1_000_000_000_000,
+            &10,
+            &token_contract,
+            &86400,
+            &100, // 1%
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        oracle_client.join_circle(&user, &circle_id, &1, &None);
+        oracle_client.deposit(&user, &circle_id);
+
+        // After a successful on-time deposit, score surges past the 500 threshold
+        assert_eq!(lending_client.can_borrow(&oracle_id, &user), true);
+    }
+
+    #[test]
+    fn test_sub_susu_credit_line() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        let circle_id = client.create_circle(&creator, &1000, &2, &token_contract, &86400, &100, &nft_contract, &arbitrator);
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user, &circle_id, &1, &None);
+        
+        // Payout to creator first to establish history and boost user score
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&creator, &circle_id);
+        
+        // Now user asks for credit advance. Expected payout = 2000. Limit is 1000.
+        client.approve_credit_advance(&creator, &circle_id, &user, &1000);
+        
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&user, &circle_id); // debt is deducted seamlessly!
+    }
+
+    #[test]
+    fn test_rollover_bonus_proposal_and_voting() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        // Set up protocol fee for rollover bonus calculation
+        client.set_protocol_fee(&admin, &100, &admin); // 1% fee
+        
+        // Create circle with 2 members
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000, // 1000 tokens
+            &2,
+            &token_contract,
+            &86400,
+            &100, // 1% insurance
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user1, &circle_id, &1, &None);
+        
+        // Complete first cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&creator, &circle_id);
+        
+        // Start second cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&user1, &circle_id);
+        
+        // Now propose rollover bonus (50% of platform fee)
+        client.propose_rollover_bonus(&creator, &circle_id, &5000);
+        
+        // Second member votes for the rollover
+        client.vote_rollover_bonus(&user1, &circle_id, &RolloverVoteChoice::For);
+        
+        // Apply the rollover bonus
+        client.apply_rollover_bonus(&circle_id);
+        
+        // Start third cycle - first recipient should get rollover bonus
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        
+        // Check that rollover bonus is applied to payout
+        let initial_balance = token_contract.mock_balance(&creator);
+        client.claim_pot(&creator, &circle_id);
+        let final_balance = token_contract.mock_balance(&creator);
+        
+        // Should receive regular pot (2000) minus fee (1% = 20) plus rollover bonus (50% of fee = 10)
+        let expected_payout = 2000 - 20 + 10; // 1990
+        assert_eq!(final_balance - initial_balance, expected_payout);
+    }
 
         let appeal_key = DataKey::ReputationAppeal(circle_id, requester.clone());
         let appeal: ReputationAppeal = env.storage().instance().get(&appeal_key).expect("Appeal not found");
