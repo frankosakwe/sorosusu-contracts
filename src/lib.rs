@@ -7,6 +7,12 @@ use soroban_sdk::{
 
 pub mod yield_allocation_voting;
 pub mod yield_strategy_trait;
+// Issue #323: VRF-based juror selection for global dispute resolution.
+pub mod juror_selection;
+
+// Issue #321: Maximum cycle duration cap (2 years in seconds) to prevent
+// integer overflow exploits and unbounded storage accumulation.
+pub const MAX_CYCLE_DURATION: u64 = 2 * 365 * 24 * 60 * 60; // 63,072,000 seconds
 
 // --- DATA STRUCTURES ---
 
@@ -29,6 +35,8 @@ pub enum DataKey {
     BatchHarvestProgress(u64),
     // New: Tracks defaulted members (CircleID, MemberAddress)
     DefaultedMember(u64, Address),
+    // Issue #320: Tracks members whose payout is held due to missing trustline
+    MissingTrustline(u64, Address),
 }
 
 #[contracttype]
@@ -202,6 +210,11 @@ impl SoroSusuTrait for SoroSusu {
         grace_period: u64,
         late_fee_bps: u32,
     ) -> u64 {
+        // Issue #321: Enforce MAX_CYCLE_DURATION cap to prevent overflow exploits.
+        if cycle_duration > MAX_CYCLE_DURATION {
+            panic!("cycle_duration exceeds MAX_CYCLE_DURATION");
+        }
+
         // 1. Get the current Circle Count
         let mut circle_count: u64 = env
             .storage()
@@ -824,6 +837,36 @@ impl SoroSusuTrait for SoroSusu {
                 // Verify member is part of the circle
                 let member_key = DataKey::Member(member_address.clone());
                 if env.storage().instance().has(&member_key) {
+                    // Issue #320: Pre-flight trustline check.
+                    // Attempt to verify the recipient has a trustline for the circle token.
+                    // On Stellar, a transfer to an address without a trustline will fail.
+                    // We detect this by checking if the member has ever interacted with the
+                    // token (contribution_count > 0 implies they deposited, so trustline exists).
+                    // For new/external recipients, we hold funds and emit MissingTrustline.
+                    let member_data: Member = env
+                        .storage()
+                        .instance()
+                        .get(&member_key)
+                        .unwrap();
+                    let has_trustline = member_data.contribution_count > 0;
+
+                    if !has_trustline {
+                        // Hold funds: mark this member's payout as pending trustline resolution.
+                        env.storage().instance().set(
+                            &DataKey::MissingTrustline(circle_id, member_address.clone()),
+                            &yield_per_member,
+                        );
+                        // Emit MissingTrustline event so off-chain systems can notify the member.
+                        env.events().publish(
+                            (Symbol::new(&env, "MissingTrustline"),),
+                            (circle_id, member_address.clone(), yield_per_member),
+                        );
+                        // Skip crediting this member; do NOT increment members_processed
+                        // so the group's execution flow is not blocked.
+                        progress.last_processed_index = i + 1;
+                        continue;
+                    }
+
                     // Get current yield balance for this member
                     let yield_key = DataKey::YieldBalance(circle_id, member_address.clone());
                     let current_balance: i128 =
