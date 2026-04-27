@@ -36,8 +36,8 @@ fn test_clawback_detection_and_pause() {
     SoroSusu::join_circle(env.clone(), user2.clone(), circle_id);
 
     // Users make deposits
-    SoroSusu::deposit(env.clone(), user1.clone(), circle_id);
-    SoroSusu::deposit(env.clone(), user2.clone(), circle_id);
+    SoroSusu::deposit(env.clone(), user1.clone(), circle_id, 1000);
+    SoroSusu::deposit(env.clone(), user2.clone(), circle_id, 1000);
 
     // Simulate clawback by reducing expected balance manually
     let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
@@ -371,7 +371,7 @@ fn test_deposit_blocked_when_paused() {
 
     // Try to deposit - should fail
     let result = std::panic::catch_unwind(|| {
-        SoroSusu::deposit(env.clone(), user1.clone(), circle_id);
+        SoroSusu::deposit(env.clone(), user1.clone(), circle_id, 1000);
     });
     assert!(result.is_err()); // Should panic because round is paused
 }

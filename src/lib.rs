@@ -48,6 +48,9 @@ pub enum DataKey {
     NonReentrant,
     // Issue #316: Zombie-group sweep
     CircleCompletedAt(u64),
+    // Issue #275: Reputation-NFT (SBT) Minting Hook
+    SbtCredential(u128),
+    UserSbt(Address),
     ArchivedGroupHash(u64),
     // Issue #322: Dispute bond slashing
     DisputeCount,
@@ -69,6 +72,27 @@ pub struct PendingSlashRecord {
 pub const APPEALS_TIMELOCK_SECS: u64 = 72 * 60 * 60; // 259_200
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum SbtStatus {
+    Discovery,
+    Pathfinder,
+    Guardian,
+    Luminary,
+    SusuLegend,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SoroSusuCredential {
+    pub token_id: u128,
+    pub user: Address,
+    pub status: SbtStatus,
+    pub reputation_score: u32,
+    pub metadata_uri: String,
+    pub issue_date: u64,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub struct Member {
     pub address: Address,
@@ -77,6 +101,7 @@ pub struct Member {
     pub last_contribution_time: u64,
     pub missed_deadline_timestamp: u64, // Tracks when member missed deadline (0 if never missed)
     pub opt_out_of_yield: bool,         // Issue #304: member opted out of yield routing
+    pub amount_contributed: u64,        // Tracks amount paid for current cycle
 }
 
 #[contracttype]
@@ -133,7 +158,7 @@ pub trait SoroSusuTrait {
     fn join_circle(env: Env, user: Address, circle_id: u64);
 
     // Make a deposit (Pay your weekly/monthly due)
-    fn deposit(env: Env, user: Address, circle_id: u64);
+    fn deposit(env: Env, user: Address, circle_id: u64, amount: u64);
 
     // Late contribution with fee (pay after deadline but within grace period)
     fn late_contribution(env: Env, user: Address, circle_id: u64);
@@ -210,6 +235,11 @@ pub trait SoroSusuTrait {
         total_yield_amount: i128,
         member_addresses: Vec<Address>,
     ) -> Result<BatchHarvestProgress, u32>;
+
+    // --- Issue #274: Group-Reputation Aggregate Score ---
+
+    /// Get the aggregate reputation score for a group (0-10000 bps).
+    fn get_group_reputation(env: Env, circle_id: u64) -> u32;
 
     // --- Issue #315: Reentrancy-guarded payout & slash_stake ---
 
@@ -404,6 +434,7 @@ impl SoroSusuTrait for SoroSusu {
             last_contribution_time: 0,
             missed_deadline_timestamp: 0,
             opt_out_of_yield: false,
+            amount_contributed: 0,
         };
 
         // 6. Store the member and update circle count
@@ -416,7 +447,7 @@ impl SoroSusuTrait for SoroSusu {
             .set(&DataKey::Circle(circle_id), &circle);
     }
 
-    fn deposit(env: Env, user: Address, circle_id: u64) {
+    fn deposit(env: Env, user: Address, circle_id: u64, amount: u64) {
         // 1. Check if contract is paused
         require_not_paused(&env);
 
@@ -454,11 +485,11 @@ impl SoroSusuTrait for SoroSusu {
         // 5. Create the Token Client
         let client = token::Client::new(&env, &circle.token);
 
-        // 6. Transfer the full amount from user (no penalty for on-time payment)
+        // 6. Transfer the amount from user (no penalty for on-time payment)
         client.transfer(
             &user,
             &env.current_contract_address(),
-            &circle.contribution_amount,
+            &amount,
         );
 
         // 8. Track initial deposit for recovery (only on first contribution)
@@ -466,7 +497,7 @@ impl SoroSusuTrait for SoroSusu {
         if !env.storage().instance().has(&deposit_key) {
             env.storage()
                 .instance()
-                .set(&deposit_key, &circle.contribution_amount);
+                .set(&deposit_key, &amount);
         }
 
         // 8.5. Track isolated contribution for opted-out members
@@ -475,13 +506,21 @@ impl SoroSusuTrait for SoroSusu {
             let current_isolated: u64 = env.storage().instance().get(&isolated_key).unwrap_or(0);
             env.storage().instance().set(
                 &isolated_key,
-                &(current_isolated + circle.contribution_amount),
+                &(current_isolated + amount),
             );
         }
 
         // 9. Update member contribution info
-        member.has_contributed = true;
-        member.contribution_count += 1;
+        member.amount_contributed += amount;
+        member.has_contributed = member.amount_contributed >= circle.contribution_amount;
+        if member.has_contributed {
+            member.contribution_count += 1;
+            
+            // Issue #275: Mint SBT for every 5 successful cycles
+            if member.contribution_count % 5 == 0 {
+                Self::mint_sbt_credential(&env, user.clone(), member.contribution_count);
+            }
+        }
         member.last_contribution_time = current_time;
         member.missed_deadline_timestamp = 0; // Reset missed deadline timestamp
 
@@ -498,6 +537,53 @@ impl SoroSusuTrait for SoroSusu {
         env.storage()
             .instance()
             .set(&DataKey::Deposit(circle_id, user), &true);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #275 – Reputation-NFT (SBT) Minting Hook
+    // -----------------------------------------------------------------------
+
+    fn mint_sbt_credential(env: &Env, user: Address, cycles_completed: u32) {
+        // Check if user already has an SBT for this level
+        let user_sbt_key = DataKey::UserSbt(user.clone());
+        if env.storage().instance().has(&user_sbt_key) {
+            // Already has SBT, skip
+            return;
+        }
+
+        // Determine status based on cycles
+        let status = match cycles_completed {
+            5 => SbtStatus::Discovery,
+            10 => SbtStatus::Pathfinder,
+            15 => SbtStatus::Guardian,
+            20 => SbtStatus::Luminary,
+            _ => SbtStatus::SusuLegend,
+        };
+
+        // Get reputation score (mock for now)
+        let reputation_score = 7500; // Mock score
+
+        // Create token ID
+        let token_id = env.ledger().timestamp() as u128 * 1000 + cycles_completed as u128;
+
+        let credential = SoroSusuCredential {
+            token_id,
+            user: user.clone(),
+            status,
+            reputation_score,
+            metadata_uri: String::from_str(env, "ipfs://sorosusu-sbt-metadata"),
+            issue_date: env.ledger().timestamp(),
+        };
+
+        // Store credential
+        env.storage().instance().set(&DataKey::SbtCredential(token_id), &credential);
+        env.storage().instance().set(&user_sbt_key, &token_id);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(env, "SbtMinted"),),
+            (user, token_id, status),
+        );
     }
 
     fn late_contribution(env: Env, user: Address, circle_id: u64) {
@@ -633,30 +719,45 @@ impl SoroSusuTrait for SoroSusu {
             return Err(405); // Member has not defaulted — nothing to slash.
         }
 
-        // Retrieve the member's collateral from the group reserve as a proxy.
-        // In a full implementation this would pull from a per-member collateral vault.
-        let mut reserve: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::GroupReserve)
-            .unwrap_or(0);
+        // Get member data
+        let member_key = DataKey::Member(member.clone());
+        let member_data: Member = env.storage().instance().get(&member_key).ok_or(402)?;
 
-        // Use the circle's contribution amount as the slash amount (simplified model).
+        // Get circle data
         let circle: CircleInfo = env
             .storage()
             .instance()
             .get(&DataKey::Circle(circle_id))
             .ok_or(401u32)?;
-        let slash_amount = circle.contribution_amount;
 
-        if reserve < slash_amount {
-            return Err(405); // Insufficient collateral to slash.
+        // Calculate remaining needed
+        let remaining_needed = circle.contribution_amount - member_data.amount_contributed;
+
+        // Calculate penalty
+        let penalty = (remaining_needed as u64 * circle.late_fee_bps as u64) / 10000;
+
+        // Calculate slash amount
+        let mut slash_amount = remaining_needed + penalty as u64;
+
+        // Cap at amount contributed
+        if slash_amount > member_data.amount_contributed {
+            slash_amount = member_data.amount_contributed;
         }
 
-        // Deduct from reserve and place in the pending vault.
-        reserve -= slash_amount;
-        env.storage().instance().set(&DataKey::GroupReserve, &reserve);
+        // Calculate remainder
+        let remainder = member_data.amount_contributed - slash_amount;
 
+        // Transfer remainder back to user if any
+        if remainder > 0 {
+            let client = token::Client::new(&env, &circle.token);
+            client.transfer(
+                &env.current_contract_address(),
+                &member,
+                &remainder,
+            );
+        }
+
+        // Move slash amount to pending vault
         let record = PendingSlashRecord {
             amount: slash_amount,
             slashed_at: env.ledger().timestamp(),
@@ -1086,6 +1187,21 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&progress_key, &progress);
 
         Ok(progress)
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #274 – Group-Reputation Aggregate Score
+    // -----------------------------------------------------------------------
+
+    fn get_group_reputation(env: Env, circle_id: u64) -> u32 {
+        // For now, return a mock calculation
+        // In a full implementation, this would calculate the average RI of all group members
+        // using the reliability oracle
+        
+        // Mock: base reputation with some variance
+        let base_reputation = 7500; // 75% base reputation
+        let variance = (circle_id % 2500) as u32; // Some variance based on circle ID
+        (base_reputation + variance).min(10000)
     }
 
     // -----------------------------------------------------------------------

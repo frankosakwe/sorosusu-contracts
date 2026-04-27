@@ -166,7 +166,7 @@ fn test_sbt_credential_issuance() {
     
     // Simulate 5 contributions (this would normally happen through regular deposits)
     for _ in 0..5 {
-        SoroSusu::deposit(env.clone(), user.clone(), circle_id);
+        SoroSusu::deposit(env.clone(), user.clone(), circle_id, 100);
     }
     
     // Issue SBT credential
@@ -219,7 +219,7 @@ fn test_sbt_revocation() {
     
     // Make contributions and issue SBT
     for _ in 0..5 {
-        SoroSusu::deposit(env.clone(), user.clone(), circle_id);
+        SoroSusu::deposit(env.clone(), user.clone(), circle_id, 100);
     }
     
     SoroSusu::issue_sbt_credential(env.clone(), admin.clone(), user.clone(), 1);

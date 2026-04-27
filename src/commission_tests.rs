@@ -92,9 +92,9 @@ fn test_zero_organizer_fee() {
     SoroSusu::join_circle(env.clone(), user3.clone(), circle_id);
 
     // Users make deposits
-    SoroSusu::deposit(env.clone(), user1.clone(), circle_id);
-    SoroSusu::deposit(env.clone(), user2.clone(), circle_id);
-    SoroSusu::deposit(env.clone(), user3.clone(), circle_id);
+    SoroSusu::deposit(env.clone(), user1.clone(), circle_id, 1000);
+    SoroSusu::deposit(env.clone(), user2.clone(), circle_id, 1000);
+    SoroSusu::deposit(env.clone(), user3.clone(), circle_id, 1000);
 
     // Distribute payout (no commission should be taken)
     SoroSusu::distribute_payout(env.clone(), user1.clone(), circle_id);
@@ -150,9 +150,9 @@ fn test_commission_calculation() {
     }
 
     // Users make deposits
-    SoroSusu::deposit(env.clone(), user1.clone(), circle_id);
-    SoroSusu::deposit(env.clone(), user2.clone(), circle_id);
-    SoroSusu::deposit(env.clone(), user3.clone(), circle_id);
+    SoroSusu::deposit(env.clone(), user1.clone(), circle_id, 1000);
+    SoroSusu::deposit(env.clone(), user2.clone(), circle_id, 1000);
+    SoroSusu::deposit(env.clone(), user3.clone(), circle_id, 1000);
 
     // Get initial balances
     let creator_initial_balance = token_client.balance(&creator);
@@ -209,8 +209,8 @@ fn test_multiple_payouts_with_commission() {
     }
 
     // Users make deposits
-    SoroSusu::deposit(env.clone(), user1.clone(), circle_id);
-    SoroSusu::deposit(env.clone(), user2.clone(), circle_id);
+    SoroSusu::deposit(env.clone(), user1.clone(), circle_id, 1000);
+    SoroSusu::deposit(env.clone(), user2.clone(), circle_id, 1000);
 
     // Get initial balances
     let creator_initial_balance = token_client.balance(&creator);
@@ -261,7 +261,7 @@ fn test_payout_before_all_contributions() {
     // Only user1 makes deposit
     let token_client = token::Client::new(&env, &token_address);
     token_client.mint(&user1, &1010);
-    SoroSusu::deposit(env.clone(), user1.clone(), circle_id);
+    SoroSusu::deposit(env.clone(), user1.clone(), circle_id, 1000);
 
     // Try to distribute payout before user2 contributes (should panic)
     SoroSusu::distribute_payout(env.clone(), user1.clone(), circle_id);

@@ -253,8 +253,8 @@ fn test_payout_fails_without_gas_buffer() {
     SoroSusu::join_circle(env.clone(), user2.clone(), circle_id, None);
 
     // Users make deposits
-    SoroSusu::deposit(env.clone(), user1.clone(), circle_id);
-    SoroSusu::deposit(env.clone(), user2.clone(), circle_id);
+    SoroSusu::deposit(env.clone(), user1.clone(), circle_id, 1000);
+    SoroSusu::deposit(env.clone(), user2.clone(), circle_id, 1000);
 
     // Finalize round
     SoroSusu::finalize_round(env.clone(), creator.clone(), circle_id);
@@ -317,8 +317,8 @@ fn test_emergency_gas_buffer_usage() {
     // Users join circle and make deposits
     SoroSusu::join_circle(env.clone(), user1.clone(), circle_id, None);
     SoroSusu::join_circle(env.clone(), user2.clone(), circle_id, None);
-    SoroSusu::deposit(env.clone(), user1.clone(), circle_id);
-    SoroSusu::deposit(env.clone(), user2.clone(), circle_id);
+    SoroSusu::deposit(env.clone(), user1.clone(), circle_id, 1000);
+    SoroSusu::deposit(env.clone(), user2.clone(), circle_id, 1000);
 
     // Finalize round
     SoroSusu::finalize_round(env.clone(), creator.clone(), circle_id);
