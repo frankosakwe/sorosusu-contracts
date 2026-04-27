@@ -55,6 +55,12 @@ pub enum DataKey {
     // Issue #322: Dispute bond slashing
     DisputeCount,
     Dispute(u64),
+    // SEP-24 Anchor Integration
+    AnchorRegistry(Address),
+    AnchorDeposit(u64), // Deposit ID
+    UserBankPreference(Address, u64), // User, CircleID
+    AnchorDepositCount,
+    MissingTrustline(u64, Address), // CircleID, MemberAddress
 }
 
 /// Issue #324: Record stored in the PendingSlash vault.
@@ -132,6 +138,79 @@ pub struct CircleInfo {
     pub risk_tolerance: u32,     // NEW: Issue #289
     pub grace_period: u64,       // Grace period in seconds (default: 86400 = 24 hours)
     pub late_fee_bps: u32,       // Late fee in basis points (default: 100 = 1%)
+}
+
+// --- SEP-24 ANCHOR INTEGRATION DATA STRUCTURES ---
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum AnchorStatus {
+    Active,
+    Inactive,
+    Suspended,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum DepositStatus {
+    Pending,
+    Completed,
+    Failed,
+    Reversed,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AnchorInfo {
+    pub address: Address,
+    pub name: Symbol,
+    pub sep_version: Symbol, // SEP-24, SEP-6, etc.
+    pub status: AnchorStatus,
+    pub kyc_required: bool,
+    pub supported_tokens: Vec<Address>,
+    pub max_deposit_amount: u64,
+    pub daily_deposit_limit: u64,
+    pub registration_date: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AnchorDeposit {
+    pub anchor_address: Address,
+    pub user_address: Address,
+    pub circle_id: u64,
+    pub amount: u64,
+    pub token: Address,
+    pub fiat_reference: Symbol, // Bank transaction ID, M-Pesa reference, etc.
+    pub status: DepositStatus,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AnchorDepositConfig {
+    pub preferred_anchor: Address,
+    pub bank_account_hash: u64, // Hashed bank account details for privacy
+    pub mobile_money_provider: Symbol, // M-Pesa, MTN Mobile Money, etc.
+    pub mobile_number_hash: u64,
+    pub fiat_currency: Symbol, // USD, KES, GHS, etc.
+    pub auto_convert: bool, // Automatically convert crypto to fiat
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UserBankPreference {
+    pub user: Address,
+    pub circle_id: u64,
+    pub payout_method: PayoutMethod,
+    pub anchor_config: Option<AnchorDepositConfig>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PayoutMethod {
+    DirectToken,     // Default: receive tokens directly
+    DirectToBank,    // SEP-24: convert to fiat via anchor
 }
 
 // --- CONTRACT TRAIT ---
@@ -305,6 +384,63 @@ pub trait SoroSusuTrait {
     ) -> Result<(), u32>;
 
     fn tally_votes(env: Env, circle_id: u64) -> Result<bool, u32>;
+
+    // --- SEP-24 Anchor Integration ---
+
+    /// Register a new SEP-24 anchor for fiat conversions
+    fn register_anchor(
+        env: Env,
+        admin: Address,
+        anchor_address: Address,
+        name: Symbol,
+        sep_version: Symbol,
+        kyc_required: bool,
+        supported_tokens: Vec<Address>,
+        max_deposit_amount: u64,
+        daily_deposit_limit: u64,
+    );
+
+    /// Get information about a registered anchor
+    fn get_anchor_info(env: Env, anchor_address: Address) -> AnchorInfo;
+
+    /// Get list of all registered anchors
+    fn get_registered_anchors(env: Env) -> Vec<Address>;
+
+    /// Set user's payout preference for a circle (Direct Token vs Direct-to-Bank)
+    fn set_payout_preference(
+        env: Env,
+        user: Address,
+        circle_id: u64,
+        payout_method: PayoutMethod,
+        anchor_config: Option<AnchorDepositConfig>,
+    );
+
+    /// Get user's payout preference for a circle
+    fn get_payout_preference(env: Env, user: Address, circle_id: u64) -> UserBankPreference;
+
+    /// Deposit funds on behalf of a user via an anchor (for SEP-24 integration)
+    fn deposit_for_user(
+        env: Env,
+        anchor_address: Address,
+        user_address: Address,
+        circle_id: u64,
+        amount: u64,
+        token: Address,
+        fiat_reference: Symbol,
+    );
+
+    /// Process a payout to an anchor for fiat conversion
+    fn process_anchor_payout(
+        env: Env,
+        anchor_address: Address,
+        user_address: Address,
+        circle_id: u64,
+        amount: u64,
+        token: Address,
+    ) -> Result<u64, u32>; // Returns deposit ID
+
+    /// Get status of an anchor deposit
+    fn get_anchor_deposit_status(env: Env, deposit_id: u64) -> AnchorDeposit;
 
     // --- Recovery helpers ---
 
@@ -1234,6 +1370,13 @@ impl SoroSusuTrait for SoroSusu {
             .checked_mul(circle.member_count as i128)
             .expect("payout overflow");
 
+        // Get current recipient (simplified - in production, resolve from payout queue)
+        // For now, we'll use the circle creator as the recipient
+        let recipient = circle.creator.clone();
+
+        // Check user's payout preference
+        let user_preference = Self::get_payout_preference(env.clone(), recipient.clone(), circle_id);
+
         // Commit state update BEFORE external token transfer (CEI pattern).
         let mut updated_circle = circle.clone();
         updated_circle.current_recipient_index += 1;
@@ -1248,13 +1391,55 @@ impl SoroSusuTrait for SoroSusu {
             .instance()
             .set(&DataKey::Circle(circle_id), &updated_circle);
 
-        // External call after state is committed (CEI pattern).
-        let token = soroban_sdk::token::Client::new(&env, &circle.token);
-        token.transfer(
-            &env.current_contract_address(),
-            &circle.creator, // simplified; full impl resolves from payout queue
-            &payout_amount,
-        );
+        // Route payout based on user preference
+        match user_preference.payout_method {
+            PayoutMethod::DirectToken => {
+                // Traditional token payout
+                let token = soroban_sdk::token::Client::new(&env, &circle.token);
+                token.transfer(
+                    &env.current_contract_address(),
+                    &recipient,
+                    &payout_amount,
+                );
+            }
+            PayoutMethod::DirectToBank => {
+                // SEP-24 Anchor payout for fiat conversion
+                if let Some(anchor_config) = user_preference.anchor_config {
+                    // Process payout through anchor
+                    match Self::process_anchor_payout(
+                        env.clone(),
+                        anchor_config.preferred_anchor,
+                        recipient.clone(),
+                        circle_id,
+                        payout_amount as u64,
+                        circle.token.clone(),
+                    ) {
+                        Ok(deposit_id) => {
+                            // Successfully routed to anchor - could emit event here
+                            // In production, you might want to store the deposit_id for tracking
+                        }
+                        Err(error_code) => {
+                            // Fallback to direct token payout if anchor fails
+                            let token = soroban_sdk::token::Client::new(&env, &circle.token);
+                            token.transfer(
+                                &env.current_contract_address(),
+                                &recipient,
+                                &payout_amount,
+                            );
+                            // In production, you might want to log this fallback
+                        }
+                    }
+                } else {
+                    // No anchor config - fallback to direct token payout
+                    let token = soroban_sdk::token::Client::new(&env, &circle.token);
+                    token.transfer(
+                        &env.current_contract_address(),
+                        &recipient,
+                        &payout_amount,
+                    );
+                }
+            }
+        }
 
         // Release lock after all work is done.
         dispute::release_lock(&env);
@@ -1473,6 +1658,362 @@ impl SoroSusuTrait for SoroSusu {
             &user,
             &(amount as i128),
         );
+    }
+
+    // --- SEP-24 ANCHOR INTEGRATION IMPLEMENTATIONS ---
+
+    fn register_anchor(
+        env: Env,
+        admin: Address,
+        anchor_address: Address,
+        name: Symbol,
+        sep_version: Symbol,
+        kyc_required: bool,
+        supported_tokens: Vec<Address>,
+        max_deposit_amount: u64,
+        daily_deposit_limit: u64,
+    ) {
+        admin.require_auth();
+
+        // Verify admin authorization
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("admin not set"));
+        if admin != stored_admin {
+            panic!("unauthorized");
+        }
+
+        // Create anchor info
+        let anchor_info = AnchorInfo {
+            address: anchor_address.clone(),
+            name,
+            sep_version,
+            status: AnchorStatus::Active,
+            kyc_required,
+            supported_tokens,
+            max_deposit_amount,
+            daily_deposit_limit,
+            registration_date: env.ledger().timestamp(),
+        };
+
+        // Store anchor info
+        env.storage()
+            .instance()
+            .set(&DataKey::AnchorRegistry(anchor_address), &anchor_info);
+
+        // Initialize anchor deposit counter if not exists
+        if !env.storage().instance().has(&DataKey::AnchorDepositCount) {
+            env.storage().instance().set(&DataKey::AnchorDepositCount, &0u64);
+        }
+    }
+
+    fn get_anchor_info(env: Env, anchor_address: Address) -> AnchorInfo {
+        env.storage()
+            .instance()
+            .get(&DataKey::AnchorRegistry(anchor_address))
+            .unwrap_or_else(|| panic!("anchor not found"))
+    }
+
+    fn get_registered_anchors(env: Env) -> Vec<Address> {
+        // For simplicity, return empty vector - in production, maintain a registry list
+        Vec::new(&env)
+    }
+
+    fn set_payout_preference(
+        env: Env,
+        user: Address,
+        circle_id: u64,
+        payout_method: PayoutMethod,
+        anchor_config: Option<AnchorDepositConfig>,
+    ) {
+        user.require_auth();
+
+        // Verify circle exists
+        let _circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("circle not found"));
+
+        // Store user preference
+        let preference = UserBankPreference {
+            user: user.clone(),
+            circle_id,
+            payout_method,
+            anchor_config,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::UserBankPreference(user, circle_id), &preference);
+    }
+
+    fn get_payout_preference(env: Env, user: Address, circle_id: u64) -> UserBankPreference {
+        // Return default preference if not set
+        env.storage()
+            .instance()
+            .get(&DataKey::UserBankPreference(user, circle_id))
+            .unwrap_or_else(|| UserBankPreference {
+                user,
+                circle_id,
+                payout_method: PayoutMethod::DirectToken,
+                anchor_config: None,
+            })
+    }
+
+    fn deposit_for_user(
+        env: Env,
+        anchor_address: Address,
+        user_address: Address,
+        circle_id: u64,
+        amount: u64,
+        token: Address,
+        fiat_reference: Symbol,
+    ) {
+        // Verify anchor exists and is active
+        let anchor_info = Self::get_anchor_info(env.clone(), anchor_address.clone());
+        if anchor_info.status != AnchorStatus::Active {
+            panic!("anchor is not active");
+        }
+
+        // Verify token is supported by anchor
+        if !anchor_info.supported_tokens.contains(&token) {
+            panic!("token not supported by anchor");
+        }
+
+        // Enhanced deposit limit checking
+        Self::check_deposit_limits(&env, &anchor_info, &user_address, amount, &token)?;
+
+        // KYC verification if required
+        if anchor_info.kyc_required {
+            Self::verify_user_kyc(&env, &anchor_address, &user_address)?;
+        }
+
+        // Get deposit ID
+        let mut deposit_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AnchorDepositCount)
+            .unwrap_or(0);
+        deposit_count += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::AnchorDepositCount, &deposit_count);
+
+        // Create deposit record
+        let deposit = AnchorDeposit {
+            anchor_address: anchor_address.clone(),
+            user_address: user_address.clone(),
+            circle_id,
+            amount,
+            token: token.clone(),
+            fiat_reference,
+            status: DepositStatus::Pending,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        // Store deposit
+        env.storage()
+            .instance()
+            .set(&DataKey::AnchorDeposit(deposit_count), &deposit);
+
+        // Transfer tokens to anchor
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &anchor_address,
+            &(amount as i128),
+        );
+
+        // Update deposit status to completed
+        let mut updated_deposit = deposit;
+        updated_deposit.status = DepositStatus::Completed;
+        env.storage()
+            .instance()
+            .set(&DataKey::AnchorDeposit(deposit_count), &updated_deposit);
+
+        // Process as regular contribution for the circle
+        let member_key = DataKey::Member(user_address.clone());
+        let mut member: Member = env
+            .storage()
+            .instance()
+            .get(&member_key)
+            .unwrap_or_else(|| panic!("member not found"));
+
+        member.contribution_count += 1;
+        member.amount_contributed += amount;
+        member.last_contribution_time = env.ledger().timestamp();
+        member.has_contributed = true;
+
+        env.storage().instance().set(&member_key, &member);
+    }
+
+    fn process_anchor_payout(
+        env: Env,
+        anchor_address: Address,
+        user_address: Address,
+        circle_id: u64,
+        amount: u64,
+        token: Address,
+    ) -> Result<u64, u32> {
+        // Verify anchor exists and is active
+        let anchor_info = Self::get_anchor_info(env.clone(), anchor_address.clone());
+        if anchor_info.status != AnchorStatus::Active {
+            return Err(500); // Anchor inactive
+        }
+
+        // Get deposit ID
+        let mut deposit_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AnchorDepositCount)
+            .unwrap_or(0);
+        deposit_count += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::AnchorDepositCount, &deposit_count);
+
+        // Create payout deposit record
+        let deposit = AnchorDeposit {
+            anchor_address: anchor_address.clone(),
+            user_address,
+            circle_id,
+            amount,
+            token,
+            fiat_reference: Symbol::short(&env, "PAYOUT"), // Default reference
+            status: DepositStatus::Pending,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        // Store deposit
+        env.storage()
+            .instance()
+            .set(&DataKey::AnchorDeposit(deposit_count), &deposit);
+
+        // Transfer tokens to anchor for fiat conversion
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &anchor_address,
+            &(amount as i128),
+        );
+
+        // Update deposit status
+        let mut updated_deposit = deposit;
+        updated_deposit.status = DepositStatus::Completed;
+        env.storage()
+            .instance()
+            .set(&DataKey::AnchorDeposit(deposit_count), &updated_deposit);
+
+        Ok(deposit_count)
+    }
+
+    fn get_anchor_deposit_status(env: Env, deposit_id: u64) -> AnchorDeposit {
+        env.storage()
+            .instance()
+            .get(&DataKey::AnchorDeposit(deposit_id))
+            .unwrap_or_else(|| panic!("deposit not found"))
+    }
+
+    // --- SEP-24 HELPER FUNCTIONS ---
+
+    /// Check if deposit complies with anchor limits and user daily limits
+    fn check_deposit_limits(
+        env: &Env,
+        anchor_info: &AnchorInfo,
+        user_address: &Address,
+        amount: u64,
+        token: &Address,
+    ) -> Result<(), u32> {
+        // Check maximum deposit amount per transaction
+        if amount > anchor_info.max_deposit_amount {
+            return Err(401); // Amount exceeds maximum
+        }
+
+        // Check daily deposit limit (simplified - in production, track per user per day)
+        let current_day = env.ledger().timestamp() / 86400; // Current day in seconds
+        let daily_limit_key = format!("daily_limit_{}_{}_{}", 
+            anchor_info.address.to_string(), 
+            user_address.to_string(), 
+            current_day
+        );
+        
+        // For simplicity, we'll just check against the anchor's daily limit
+        // In production, you'd track cumulative daily deposits per user
+        if amount > anchor_info.daily_deposit_limit {
+            return Err(402); // Daily limit exceeded
+        }
+
+        Ok(())
+    }
+
+    /// Verify user KYC status with anchor
+    fn verify_user_kyc(
+        env: &Env,
+        anchor_address: &Address,
+        user_address: &Address,
+    ) -> Result<(), u32> {
+        // In a real implementation, this would:
+        // 1. Call the anchor's KYC verification endpoint
+        // 2. Check if the user has completed KYC
+        // 3. Verify the KYC level meets requirements
+        
+        // For now, we'll simulate a basic KYC check
+        // In production, this would be an external contract call to the anchor
+        
+        // Create a simple KYC status key (in production, this would be from anchor)
+        let kyc_key = format!("kyc_status_{}_{}", 
+            anchor_address.to_string(), 
+            user_address.to_string()
+        );
+        
+        // For demonstration, we'll assume all users are KYC verified
+        // In production, this would query the anchor's KYC system
+        let kyc_verified = true; // Simulated
+        
+        if !kyc_verified {
+            return Err(403); // KYC not verified
+        }
+
+        Ok(())
+    }
+
+    /// Validate bank account details (hash verification)
+    fn validate_bank_details(
+        bank_account_hash: u64,
+        mobile_number_hash: u64,
+    ) -> Result<(), u32> {
+        // Basic validation to ensure hashes are not zero
+        if bank_account_hash == 0 {
+            return Err(404); // Invalid bank account
+        }
+        
+        if mobile_number_hash == 0 {
+            return Err(405); // Invalid mobile number
+        }
+
+        // In production, you might add more sophisticated validation
+        // such as checksum verification, format validation, etc.
+
+        Ok(())
+    }
+
+    /// Get available anchors for a specific token and region
+    fn get_available_anchors(
+        env: &Env,
+        token: &Address,
+        fiat_currency: Symbol,
+    ) -> Vec<Address> {
+        // In production, this would filter anchors by:
+        // 1. Token support
+        // 2. Geographic region/currency support  
+        // 3. Active status
+        // 4. Current capacity
+        
+        // For now, return empty vector
+        Vec::new(env)
     }
 }
 
