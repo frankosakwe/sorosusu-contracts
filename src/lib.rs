@@ -5,6 +5,7 @@ use soroban_sdk::{
     Symbol, Vec,
 };
 
+pub mod chat_metadata;
 pub mod dispute;
 pub mod yield_allocation_voting;
 pub mod yield_strategy_trait;
