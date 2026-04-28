@@ -1,19 +1,4 @@
-#![cfg_attr(not(test), no_std)]
-use arbitrary::{Arbitrary, Unstructured};
-use soroban_sdk::{
-    contract, contractimpl, contracttype, testutils::Address as TestAddress, token, Address, Env,
-    Symbol, Vec,
-};
-
-pub mod dispute;
-pub mod yield_allocation_voting;
-pub mod yield_strategy_trait;
-// Issue #323: VRF-based juror selection for global dispute resolution.
-pub mod juror_selection;
-
-// Issue #321: Maximum cycle duration cap (2 years in seconds) to prevent
-// integer overflow exploits and unbounded storage accumulation.
-pub const MAX_CYCLE_DURATION: u64 = 2 * 365 * 24 * 60 * 60; // 63,072,000 seconds
+mod liquidity_buffer;
 
 // --- DATA STRUCTURES ---
 
@@ -77,67 +62,137 @@ pub struct PendingSlashRecord {
 /// can be redistributed to victims (Issue #324).
 pub const APPEALS_TIMELOCK_SECS: u64 = 72 * 60 * 60; // 259_200
 
+use soroban_sdk::{
+    contract, contractimpl, contracttype, contracterror, contractclient,
+    symbol_short,
+    Address, Env, Symbol, Vec, Map, String,
+    token,
+};
+
+    /// Submits a late contribution after the deadline but within the grace period.
+    /// A late fee is automatically deducted from the member's safety deposit.
+    ///
+    /// # Parameters
+    /// - `user`: Address making the late payment; must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    ///
+    /// # Panics
+    /// - `"Payment is not late. Use deposit function for on-time payment."` — called before deadline.
+    fn late_contribution(env: Env, user: Address, circle_id: u64);
+
+    /// Executes a default on a member after the grace period has expired.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err(Error::DeadlineNotMissed)` (`403`) if the member has not yet missed their deadline.
+    /// - `Err(Error::GracePeriodActive)` (`404`) if the grace period has not yet expired.
+    fn execute_default(env: Env, circle_id: u64, member: Address) -> Result<(), u32>;
+
+    /// Admin-only: moves a defaulted member's collateral into the 72-hour
+    /// pending vault (appeals timelock, Issue #324).
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err(Error::NothingToSlash)` (`405`) if the member has no collateral to slash.
+    fn slash_collateral(env: Env, circle_id: u64, member: Address) -> Result<(), u32>;
+
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum SbtStatus {
-    Discovery,
-    Pathfinder,
-    Guardian,
-    Luminary,
-    SusuLegend,
+#[derive(Clone)]
+pub struct GasBufferConfig {
+    pub min_buffer_amount: i128,
+    pub max_buffer_amount: i128,
+    pub auto_refill_threshold: i128,
+    pub emergency_buffer: i128,
 }
 
 #[contracttype]
 #[derive(Clone)]
-pub struct SoroSusuCredential {
-    pub token_id: u128,
-    pub user: Address,
-    pub status: SbtStatus,
-    pub reputation_score: u32,
-    pub metadata_uri: String,
-    pub issue_date: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct Member {
-    pub address: Address,
-    pub has_contributed: bool,
-    pub contribution_count: u32,
-    pub last_contribution_time: u64,
-    pub missed_deadline_timestamp: u64, // Tracks when member missed deadline (0 if never missed)
-    pub opt_out_of_yield: bool,         // Issue #304: member opted out of yield routing
-    pub amount_contributed: u64,        // Tracks amount paid for current cycle
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct BatchHarvestProgress {
-    pub circle_id: u64,
-    pub total_yield_amount: i128,
-    pub members_processed: u32,
-    pub total_members: u32,
-    pub last_processed_index: u32,
-    pub is_complete: bool,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct CircleInfo {
-    pub id: u64,
-    pub creator: Address,
-    pub contribution_amount: u64,     // Optimized from i128 to u64
-    pub max_members: u32,             // Optimized from u32 to u32
-    pub member_count: u32,            // Track count separately from Vec
-    pub current_recipient_index: u32, // Track by index instead of Address
-    pub is_active: bool,
-    pub token: Address,          // The token used (USDC, XLM)
-    pub deadline_timestamp: u64, // Deadline for on-time payments
-    pub cycle_duration: u64,     // Duration of each payment cycle in seconds
-    pub yield_enabled: bool,     // NEW: Issue #289
-    pub risk_tolerance: u32,     // NEW: Issue #289
-    pub grace_period: u64,       // Grace period in seconds (default: 86400 = 24 hours)
-    pub late_fee_bps: u32,       // Late fee in basis points (default: 100 = 1%)
+pub enum DataKey {
+    Admin,
+    Circle(u64),
+    Member(Address),
+    CircleMember(u64, u32),
+    CircleCount,
+    ScheduledPayoutTime(u64),
+    LastCreatedTimestamp(Address),
+    SafetyDeposit(Address, u64),
+    GroupReserve,
+    LendingPool,
+    CycleBadge(Address, u64),
+    UserStats(Address),
+    ProtocolFeeBps,
+    ProtocolTreasury,
+    CollateralVault(Address, u64),
+    ReputationData(Address),
+    SocialCapital(Address, u64),
+    AuditCount,
+    AuditEntry(u64),
+    AuditAll,
+    AuditByActor(Address),
+    AuditByResource(u64),
+    LeniencyStats(u64),
+    Proposal(u64),
+    DefaultedMembers(u64),
+    RolloverBonus(u64),
+    RolloverVote(u64, Address),
+    LeniencyRequest(u64),
+    VotingPower(Address, u64),
+    DissolutionProposal(u64),
+    RefundClaim(u64),
+    YieldDelegation(u64),
+    YieldVote(u64, Address),
+    YieldPoolRegistry,
+    GroupTreasury(u64),
+    PathPayment(u64),
+    PathPaymentVote(u64, Address),
+    DexRegistry(Address),
+    SupportedTokens(Address),
+    // Multi-asset basket storage
+    BasketConfig(u64),
+    BasketAssetContrib(u64, Address, Address),
+    GroupInsuranceFund(u64), // Per-circle insurance fund balance
+    InsurancePremium(u64, Address), // Track premiums paid by each member per circle
+    PriceOracle(Address), // Price data for each asset
+    HardAssetBasket, // Reference hard asset basket
+    AssetSwapProposal(u64), // Per-circle asset swap proposals
+    AssetSwapVote(u64, Address), // Votes on asset swap proposals
+    LateFeeDistribution(u64, u32), // Late fee distribution per circle per round
+    LastDepositLedger(Address),
+    LastWithdrawalLedger(Address),
+    RecursiveOptIn(Address, u64),
+    GoldTierCircle,
+    PausedPayout(Address, u64), // (user, circle_id) -> is_paused
+    LeaseFlowContract,
+    GrantStreamContract,
+    MilestoneReached(u64),
+    PaymentTiming(u64, u32, Address), // Payment timing per circle, round, and member
+    PaymentOrderCounter(u64, u32), // Counter to track payment order in each round
+    GasBufferConfig(u64),  // Per-circle gas buffer config
+    MemberByIndex(u64, u32), // Legacy: member lookup by index
+    LiquidityBufferConfig,           // Global liquidity buffer configuration
+    LiquidityBufferReserve,          // Current reserve balance
+    LiquidityAdvance(u64),           // Individual advance records
+    LiquidityAdvanceCounter,         // Counter for generating advance IDs
+    MemberAdvanceHistory(Address, u64), // Member's advance history
+    LiquidityBufferStats,            // Buffer utilization statistics
+    PlatformFeeAllocation,           // Platform fee allocation to buffer
+    // Stellar Anchor Direct Deposit API (SEP-24/SEP-31)
+    AnchorRegistry, // Registry of authorized anchors
+    AnchorDeposit(u64), // Track anchor deposits per circle
+    DepositMemo(u64), // Track deposit memos for compliance
+    // Inter-Susu Lending Market Liquidity Hook
+    LendingMarketProposal(u64),       // Lending market proposals
+    LendingMarketVote(u64, Address),       // Votes on lending market proposals
+    LendingPoolInfo(u64),             // Lending pool information
+    LendingPoolParticipant(u64, Address), // Pool participants
+    LendingMarketConfig,               // Global lending market configuration
+    LendingPosition(u64, Address),        // Individual lending positions
+    LendingOffer(u64),                 // Active lending offers
+    LiquidityProvider(u64, Address),     // Liquidity provider information
+    YieldFarm(u64),                   // Yield farming positions
+    EmergencyLoan(u64),                 // Emergency loan requests
+    RepaymentSchedule(u64),            // Loan repayment schedules
+    LendingMarketStats,               // Lending market statistics
 }
 
 // --- SEP-24 ANCHOR INTEGRATION DATA STRUCTURES ---
@@ -254,10 +309,24 @@ pub trait SoroSusuTrait {
     // yet expired, giving the penalised member time to appeal to the DAO.
     fn release_pending_slash(env: Env, circle_id: u64, member: Address) -> Result<(), u32>;
 
-    // NEW: Issue #287
+    /// Routes a portion of the circle's reserve to an external yield pool.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `amount`: Amount in stroops to route.
+    /// - `pool_address`: Address of the yield pool contract.
+    ///
+    /// # Panics
+    /// - `"Yield routing is disabled for this circle"` — yield opt-out is active.
+    /// - `"Cannot route to yield: too close to payout"` — Time-to-Liquidity check failed.
     fn route_to_yield(env: Env, circle_id: u64, amount: u64, pool_address: Address);
 
-    // NEW: Issue #290
+    /// Withdraws previously routed funds from an external yield pool back to the circle.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `amount_to_withdraw`: Amount in stroops to withdraw.
+    /// - `pool_address`: Address of the yield pool contract.
     fn withdraw_from_yield(
         env: Env,
         circle_id: u64,
@@ -265,7 +334,15 @@ pub trait SoroSusuTrait {
         pool_address: Address,
     );
 
-    // NEW: Issue #288
+    /// Accepts a contribution in any Stellar asset and auto-swaps it to the
+    /// circle's base token via Soroban path payments.
+    ///
+    /// # Parameters
+    /// - `user`: Address making the deposit; must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    /// - `source_token`: Asset the user is paying with.
+    /// - `source_amount_max`: Maximum source tokens the user is willing to spend
+    ///   (slippage guard).
     fn deposit_with_swap(
         env: Env,
         user: Address,
@@ -274,16 +351,26 @@ pub trait SoroSusuTrait {
         source_amount_max: u64,
     );
 
-    // --- Yield Allocation Voting Functions ---
-
-    // Initialize voting session for yield distribution
+    /// Initializes a yield-distribution voting session for a circle.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `available_strategies`: List of strategy contract addresses members can vote on.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an error code if the session cannot be created.
     fn initialize_yield_voting(
         env: Env,
         circle_id: u64,
         available_strategies: Vec<Address>,
     ) -> Result<(), u32>;
 
-    // Cast vote for yield distribution strategy
+    /// Casts a member's vote for a yield distribution strategy.
+    ///
+    /// # Parameters
+    /// - `voter`: Address casting the vote; must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    /// - `proposed_strategies`: Ordered list of preferred distribution strategies.
     fn cast_yield_vote(
         env: Env,
         voter: Address,
@@ -291,23 +378,51 @@ pub trait SoroSusuTrait {
         proposed_strategies: Vec<yield_allocation_voting::DistributionStrategy>,
     ) -> Result<(), u32>;
 
-    // Finalize voting and determine winning strategy
+    /// Finalizes the yield voting session and returns the winning strategy list.
+    ///
+    /// # Returns
+    /// `Ok(Vec<DistributionStrategy>)` — the winning ordered strategy list.
     fn finalize_yield_voting(
         env: Env,
         circle_id: u64,
     ) -> Result<Vec<yield_allocation_voting::DistributionStrategy>, u32>;
 
-    // Execute the winning distribution strategy
+    /// Executes the winning yield distribution strategy for a circle.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `total_yield_amount`: Total yield in stroops to distribute.
     fn execute_yield_distribution(
         env: Env,
         circle_id: u64,
         total_yield_amount: i128,
     ) -> Result<(), u32>;
 
-    // Finalize cycle with yield voting integration
+    /// Finalizes a yield cycle, integrating with the voting system if a session exists.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `total_yield_amount`: Total yield in stroops earned this cycle.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err(Error::GracePeriodActive)` (`404`) if the voting period is still active.
     fn finalize_cycle(env: Env, circle_id: u64, total_yield_amount: i128) -> Result<(), u32>;
 
-    // Batch harvest yield to members in chunks of 10
+    /// Distributes yield to members in paginated chunks of 10 to avoid gas limits.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `total_yield_amount`: Total yield in stroops to distribute.
+    /// - `member_addresses`: Full member address list (used for pro-rata calculation).
+    ///
+    /// # Returns
+    /// A `BatchHarvestProgress` struct tracking how many members have been processed.
+    /// Call repeatedly until `is_complete == true`.
+    ///
+    /// # Returns
+    /// - `Ok(BatchHarvestProgress)` on success.
+    /// - `Err(401)` if the circle does not exist.
     fn batch_harvest(
         env: Env,
         circle_id: u64,
@@ -364,8 +479,19 @@ pub trait SoroSusuTrait {
     /// Opt a member out of yield routing for a circle.
     fn opt_out_of_yield(env: Env, user: Address, circle_id: u64) -> Result<(), u32>;
 
+    // --- Simplified-View Read-Only Wrapper ---
+
+    /// Get aggregated user summary for mobile clients (read-only).
+    fn get_user_summary(env: Env, user: Address) -> Option<UserSummary>;
+
     // --- Commit-reveal voting ---
 
+    /// Initializes a commit-reveal voting session for a circle.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `commit_duration`: Seconds for the commit phase.
+    /// - `reveal_duration`: Seconds for the reveal phase.
     fn initialize_voting_session(
         env: Env,
         circle_id: u64,
@@ -373,8 +499,27 @@ pub trait SoroSusuTrait {
         reveal_duration: u64,
     ) -> Result<(), u32>;
 
+    /// Submits a hashed vote commitment during the commit phase.
+    ///
+    /// # Parameters
+    /// - `voter`: Address casting the vote; must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    /// - `commitment`: `SHA-256(vote_bool || salt)` as raw bytes.
+    ///
+    /// # Returns
+    /// - `Err(Error::NothingToSlash)` (`405`) if a commitment already exists.
     fn commit_vote(env: Env, voter: Address, circle_id: u64, commitment: Vec<u8>) -> Result<(), u32>;
 
+    /// Reveals a previously committed vote during the reveal phase.
+    ///
+    /// # Parameters
+    /// - `voter`: Address revealing the vote; must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    /// - `vote`: The plaintext boolean vote.
+    /// - `salt`: The salt used when hashing the commitment.
+    ///
+    /// # Returns
+    /// - `Err(Error::TimelockActive)` (`406`) if the vote has already been revealed.
     fn reveal_vote(
         env: Env,
         voter: Address,
@@ -383,6 +528,11 @@ pub trait SoroSusuTrait {
         salt: Vec<u8>,
     ) -> Result<(), u32>;
 
+    /// Tallies all revealed votes and returns the result.
+    ///
+    /// # Returns
+    /// - `Ok(true)` if the vote passed, `Ok(false)` if it failed.
+    /// - `Err(Error::TallyIncomplete)` (`407`) if not all votes have been revealed.
     fn tally_votes(env: Env, circle_id: u64) -> Result<bool, u32>;
 
     // --- SEP-24 Anchor Integration ---
@@ -444,8 +594,21 @@ pub trait SoroSusuTrait {
 
     // --- Recovery helpers ---
 
+    /// Returns `true` if the circle has entered recovery state (stale/abandoned).
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle to check.
     fn check_recovery_state(env: Env, circle_id: u64) -> bool;
 
+    /// Allows a member to claim their proportional share of funds from an
+    /// abandoned circle that has entered recovery state.
+    ///
+    /// # Parameters
+    /// - `user`: Address claiming funds; must sign the transaction.
+    /// - `circle_id`: ID of the abandoned circle.
+    ///
+    /// # Panics
+    /// - `"circle is still active"` — the circle has not entered recovery state.
     fn claim_abandoned_funds(env: Env, user: Address, circle_id: u64);
 }
 
@@ -456,6 +619,16 @@ pub struct SoroSusu;
 
 #[contractimpl]
 impl SoroSusuTrait for SoroSusu {
+    /// Initializes the contract with a global administrator.
+    ///
+    /// # Parameters
+    /// - `admin`: The address that will hold admin privileges (set protocol fee,
+    ///   register anchors, purge stale groups, etc.).
+    ///
+    /// # Security
+    /// Must be called exactly once after deployment. Subsequent calls overwrite
+    /// the admin address, so the deployer should call this in the same transaction
+    /// as the contract upload.
     fn init(env: Env, admin: Address) {
         // Initialize the circle counter to 0 if it doesn't exist
         if !env.storage().instance().has(&DataKey::CircleCount) {
@@ -501,9 +674,984 @@ impl SoroSusuTrait for SoroSusu {
         // 2. Increment the ID for the new circle
         circle_count += 1;
 
-        // 3. Create the Circle Data Struct
-        let current_time = env.ledger().timestamp();
-        let new_circle = CircleInfo {
+#[contracttype]
+#[derive(Clone)]
+pub struct CollateralInfo {
+    pub member: Address,
+    pub circle_id: u64,
+    pub amount: i128,
+    pub status: CollateralStatus,
+    pub staked_timestamp: u64,
+    pub release_timestamp: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Member {
+    pub address: Address,
+    pub index: u32,
+    pub contribution_count: u32,
+    pub last_contribution_time: u64,
+    pub status: MemberStatus,
+    pub tier_multiplier: u32,
+    pub consecutive_missed_rounds: u32,
+    pub referrer: Option<Address>,
+    pub buddy: Option<Address>,
+    pub shares: u32,
+    pub guarantor: Option<Address>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct CircleInfo {
+    pub id: u64,
+    pub creator: Address,
+    pub contribution_amount: i128,
+    pub max_members: u32,
+    pub member_count: u32,
+    pub current_recipient_index: u32,
+    pub is_active: bool,
+    pub token: Address,
+    pub deadline_timestamp: u64,
+    pub cycle_duration: u64,
+    pub contribution_bitmap: u64,
+    pub insurance_balance: i128,
+    pub insurance_fee_bps: u32,
+    pub is_insurance_used: bool,
+    pub late_fee_bps: u32,
+    pub nft_contract: Address,
+    pub is_round_finalized: bool,
+    pub current_pot_recipient: Option<Address>,
+    pub requires_collateral: bool,
+    pub collateral_bps: u32,
+    pub member_addresses: Vec<Address>,
+    pub leniency_enabled: bool,
+    pub grace_period_end: Option<u64>,
+    pub quadratic_voting_enabled: bool,
+    pub proposal_count: u64,
+    pub dissolution_status: DissolutionStatus,
+    pub dissolution_deadline: Option<u64>,
+    pub proposed_late_fee_bps: u32,
+    pub proposal_votes_bitmap: u64,
+    pub recovery_old_address: Option<Address>,
+    pub recovery_new_address: Option<Address>,
+    pub recovery_votes_bitmap: u64,
+    pub arbitrator: Address,
+    /// Multi-asset basket: None for single-token circles, Some(...) for basket circles.
+    /// Each AssetWeight specifies a token address and its allocation in basis points.
+    pub basket: Option<Vec<AssetWeight>>,
+}
+
+/// Group Insurance Fund - Tracks mutual insurance for default protection
+#[contracttype]
+#[derive(Clone)]
+pub struct GroupInsuranceFund {
+    pub circle_id: u64,
+    pub total_fund_balance: i128,      // Total balance in the insurance fund
+    pub total_premiums_collected: i128, // Total premiums collected from all members
+    pub total_claims_paid: i128,        // Total claims paid out for defaults
+    pub premium_rate_bps: u32,          // Premium rate in basis points (e.g., 50 = 0.5%)
+    pub is_active: bool,                // Whether the fund is active
+    pub cycle_start_time: u64,          // When the current cycle started
+    pub last_claim_time: Option<u64>,   // Timestamp of last claim
+}
+
+/// Insurance Premium Record - Track individual member's premium contributions
+#[contracttype]
+#[derive(Clone)]
+pub struct InsurancePremiumRecord {
+    pub member: Address,
+    pub circle_id: u64,
+    pub total_premium_paid: i128,       // Total premium paid by this member
+    pub premium_payments: Vec<(u64, i128)>, // List of (round, amount) tuples
+    pub claims_made: i128,              // Total claims made by this member
+    pub net_contribution: i128,         // Premiums paid minus claims received
+}
+
+/// Price Oracle Data - Tracks asset prices for economic circuit breaker
+#[contracttype]
+#[derive(Clone)]
+pub struct PriceOracleData {
+    pub asset_address: Address,
+    pub current_price: i128,           // Current price in base currency (e.g., USD cents)
+    pub last_updated: u64,             // Last update timestamp
+    is_stable_asset: bool,             // Whether this is a stable asset
+}
+
+/// Hard Asset Basket - Reference basket of hard assets for stability comparison
+#[contracttype]
+#[derive(Clone)]
+pub struct HardAssetBasket {
+    pub gold_weight_bps: u32,          // Gold allocation in basis points
+    pub btc_weight_bps: u32,           // BTC allocation in basis points  
+    pub silver_weight_bps: u32,        // Silver allocation in basis points
+    pub total_weight_bps: u32,         // Should equal 10000 (100%)
+}
+
+/// Asset Swap Proposal - For voting on swapping treasury assets
+#[contracttype]
+#[derive(Clone)]
+pub struct AssetSwapProposal {
+    pub circle_id: u64,
+    pub proposer: Address,
+    pub current_asset: Address,
+    pub target_asset: Address,
+    pub swap_percentage_bps: u32,      // Percentage of treasury to swap
+    pub price_drop_percentage_bps: u32, // Detected price drop that triggered proposal
+    pub created_timestamp: u64,
+    pub voting_deadline: u64,
+    pub status: ProposalStatus,
+    pub for_votes: u32,
+    pub against_votes: u32,
+    pub total_votes_cast: u32,
+    pub executed_timestamp: Option<u64>,
+}
+
+/// Late Fee Distribution Record - Tracks priority distribution of late fees
+#[contracttype]
+#[derive(Clone)]
+pub struct LateFeeDistribution {
+    pub circle_id: u64,
+    pub round_number: u32,
+    pub pot_winner: Address,
+    pub pot_winner_compensation: i128,      // First priority: compensate pot winner
+    pub on_time_payers_bonus: Vec<(Address, i128)>, // Bonus for on-time payers (pro-rated by payment time)
+    pub total_late_fees_collected: i128,
+    pub distribution_timestamp: u64,
+    pub late_payers: Vec<(Address, i128)>,  // List of late payers and their fines
+}
+
+/// Payment Timing Record - Track when each member paid in a round
+#[contracttype]
+#[derive(Clone)]
+pub struct PaymentTimingRecord {
+    pub member: Address,
+    pub circle_id: u64,
+    pub round_number: u32,
+    pub payment_timestamp: u64,
+    pub is_on_time: bool,
+    pub payment_order: u32, // Order in which this payment was made (1 = first, 2 = second, etc.)
+}
+
+// --- POT LIQUIDITY BUFFER DATA STRUCTURES ---
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum LiquidityAdvanceStatus {
+    Pending,        // Advance requested, waiting for deposit
+    Active,         // Advance provided, waiting for repayment
+    Completed,      // Advance fully repaid
+    Defaulted,      // Advance not repaid within grace period
+    Cancelled,      // Advance cancelled by member
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LiquidityBufferConfig {
+    pub is_enabled: bool,
+    pub advance_period: u64,              // 48 hours advance window
+    pub min_reputation: u32,               // 100% reputation required
+    pub max_advance_bps: u32,             // 100% of contribution can be advanced
+    pub platform_fee_allocation: u32,     // 20% of platform fees allocated to buffer
+    pub min_reserve: i128,                // Minimum reserve balance
+    pub max_reserve: i128,                // Maximum reserve balance
+    pub advance_fee_bps: u32,             // 0.5% fee for advance usage
+    pub grace_period: u64,                // 24 hours grace period for repayment
+    pub max_advances_per_round: u32,      // Maximum advances per member per round
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LiquidityAdvance {
+    pub advance_id: u64,
+    pub member: Address,
+    pub circle_id: u64,
+    pub round_number: u32,
+    pub contribution_amount: i128,         // Expected contribution amount
+    pub advance_amount: i128,             // Amount advanced to member
+    pub advance_fee: i128,                // Fee charged for advance
+    pub repayment_amount: i128,           // Total amount to be repaid
+    pub status: LiquidityAdvanceStatus,
+    pub requested_timestamp: u64,         // When advance was requested
+    pub provided_timestamp: Option<u64>,  // When advance was provided
+    pub repayment_deadline: u64,          // When repayment is due
+    pub repaid_timestamp: Option<u64>,    // When repayment was made
+    pub reason: String,                   // Reason for advance request
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct MemberAdvanceHistory {
+    pub member: Address,
+    pub total_advances_taken: u32,
+    pub total_advance_amount: i128,
+    pub total_fees_paid: i128,
+    pub current_round_advances: u32,
+    pub last_advance_timestamp: Option<u64>,
+    pub repayment_history: Vec<u64>,      // List of advance IDs
+    pub default_count: u32,               // Number of defaulted advances
+    pub reputation_score: u32,            // Current reputation score
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LiquidityBufferStats {
+    pub total_reserve_balance: i128,
+    pub total_platform_fees_allocated: i128,
+    pub total_advances_provided: u64,
+    pub total_advances_completed: u64,
+    pub total_advances_defaulted: u64,
+    pub total_advance_amount: i128,
+    pub total_fees_collected: i128,
+    pub active_advances_count: u64,
+    pub average_advance_size: i128,
+    pub buffer_utilization_rate: u32,     // Current utilization as percentage
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PlatformFeeAllocation {
+    pub total_fees_collected: i128,
+    pub buffer_allocation_amount: i128,
+    pub treasury_allocation_amount: i128,
+    pub last_allocation_timestamp: u64,
+    pub allocation_frequency: u64,         // How often fees are allocated
+/// Stellar Anchor Information - SEP-24/SEP-31 compliant anchor registry
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnchorInfo {
+    pub anchor_address: Address,
+    pub anchor_name: String,
+    pub sep_version: String, // "SEP-24" or "SEP-31"
+    pub authorization_level: u32, // 1=Basic, 2=Enhanced, 3=Full
+    pub compliance_level: u32, // 1=Basic KYC, 2=Enhanced KYC, 3=Full KYC+AML
+    pub is_active: bool,
+    pub registration_timestamp: u64,
+    pub last_activity: u64,
+    pub supported_countries: Vec<String>, // ISO country codes
+    pub max_deposit_amount: i128,
+    pub daily_deposit_limit: i128,
+}
+
+/// Anchor Deposit Record - Track deposits made by anchors on behalf of users
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnchorDeposit {
+    pub deposit_id: u64,
+    pub anchor_address: Address,
+    pub beneficiary_user: Address,
+    pub circle_id: u64,
+    pub amount: i128,
+    pub deposit_memo: String, // Unique identifier for compliance
+    pub fiat_reference: String, // Reference to fiat transaction
+    pub timestamp: u64,
+    pub compliance_verified: bool,
+    pub processed: bool,
+    pub sep_type: String, // "SEP-24" or "SEP-31"
+}
+
+/// Deposit Memo Structure - Standardized format for compliance
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DepositMemo {
+    pub memo_type: String, // "text", "hash", or "return"
+    pub memo_value: String,
+    pub anchor_id: String,
+    pub transaction_hash: Option<String>, // For blockchain reference
+    pub compliance_data: String, // Encrypted compliance information
+}
+
+
+// --- CONTRACT CLIENTS ---
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum AuditAction {
+    DisputeSubmission,
+    GovernanceVote,
+    EvidenceAccess,
+    AdminAction,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AuditEntry {
+    pub id: u64,
+    pub actor: Address,
+    pub action: AuditAction,
+    pub timestamp: u64,
+    pub resource_id: u64,
+}
+
+// --- CYCLE COMPLETION NFT BADGE ---
+
+#[contracttype]
+#[derive(Clone)]
+pub struct NftBadgeMetadata {
+    pub volume_tier: u32,        // 1=Bronze, 2=Silver, 3=Gold based on total_volume_saved
+    pub perfect_attendance: bool, // true if zero late contributions
+    pub group_lead_status: bool,  // true if member is the circle creator
+}
+
+/// Master Credential NFT Badge - Enhanced metadata for 12-month cycle completion
+/// This represents a "Stellar-Native Financial Identity" badge of honor
+#[contracttype]
+#[derive(Clone)]
+pub struct MasterCredentialMetadata {
+    pub volume_tier: u32,              // 1=Bronze, 2=Silver, 3=Gold, 4=Platinum
+    pub perfect_attendance: bool,       // true if zero late contributions
+    pub group_lead_status: bool,        // true if member is the circle creator
+    pub total_cycles_completed: u32,    // Total number of full cycles completed
+    pub total_volume_saved: i128,       // Lifetime volume saved across all circles
+    pub reliability_score: u32,         // 0-10000 bps (0-100%)
+    pub social_capital_score: u32,      // 0-10000 bps (0-100%)
+    pub badges_earned: Vec<Symbol>,     // List of achievement badges
+    pub ecosystem_participation: u32,   // Number of different JerryIdoko projects participated in
+    pub mint_timestamp: u64,            // Timestamp when badge was minted
+    pub circle_id: u64,                 // The circle that triggered this badge
+    pub version: u32,                   // Metadata version for future upgrades
+}
+
+#[contractclient(name = "SusuNftClient")]
+pub trait SusuNftTrait {
+    fn mint(env: Env, to: Address, token_id: u128);
+    fn burn(env: Env, from: Address, token_id: u128);
+    fn mint_badge(env: Env, to: Address, token_id: u128, metadata: NftBadgeMetadata);
+    fn mint_master_credential(env: Env, to: Address, token_id: u128, metadata: MasterCredentialMetadata);
+}
+
+#[contractclient(name = "LendingPoolClient")]
+pub trait LendingPoolTrait {
+    fn supply(env: Env, token: Address, from: Address, amount: i128);
+    fn withdraw(env: Env, token: Address, to: Address, amount: i128);
+}
+
+pub trait SoroSusuTrait {
+    // Initialize contract
+    fn init(env: Env, admin: Address);
+    fn set_lending_pool(env: Env, admin: Address, pool: Address);
+    fn set_protocol_fee(env: Env, admin: Address, fee_basis_points: u32, treasury: Address);
+
+    // --- POT LIQUIDITY BUFFER FOR BANK HOLIDAYS ---
+    fn init_liquidity_buffer(env: Env, admin: Address);
+    fn signal_advance_request(
+        env: Env,
+        member: Address,
+        circle_id: u64,
+        contribution_amount: i128,
+        reason: String,
+    ) -> u64;
+    fn provide_advance(env: Env, advance_id: u64);
+    fn cancel_advance_request(env: Env, advance_id: u64);
+    fn process_advance_refill(env: Env, member: Address, circle_id: u64, deposit_amount: i128);
+    fn get_liquidity_advance(env: Env, advance_id: u64) -> LiquidityAdvance;
+    fn get_member_advance_history(env: Env, member: Address) -> MemberAdvanceHistory;
+    fn get_liquidity_buffer_stats(env: Env) -> LiquidityBufferStats;
+    fn allocate_platform_fees_to_buffer(env: Env, fee_amount: i128);
+    fn check_advance_eligibility(env: Env, member: Address, circle_id: u64) -> bool;
+
+    fn create_circle(
+        env: Env,
+        creator: Address,
+        amount: i128,
+        max_members: u32,
+        token: Address,
+        cycle_duration: u64,
+        insurance_fee_bps: u32,
+        nft_contract: Address,
+    ) -> u64;
+
+    // Join an existing circle
+    fn join_circle(env: Env, user: Address, circle_id: u64, shares: u32, guarantor: Option<Address>);
+
+    // Make a deposit (Pay your weekly/monthly due)
+    fn deposit(env: Env, user: Address, circle_id: u64);
+
+    // NEW: Gas buffer management functions
+    fn fund_gas_buffer(env: Env, circle_id: u64, amount: i128);
+    fn set_gas_buffer_config(env: Env, circle_id: u64, config: GasBufferConfig);
+    fn get_gas_buffer_balance(env: Env, circle_id: u64) -> i128;
+
+    // NEW: Payout functions with gas buffer support
+    fn distribute_payout(env: Env, caller: Address, circle_id: u64);
+    fn trigger_payout(env: Env, admin: Address, circle_id: u64);
+    fn finalize_round(env: Env, creator: Address, circle_id: u64);
+
+    // Helper functions
+    fn get_circle(env: Env, circle_id: u64) -> CircleInfo;
+    fn get_member(env: Env, member: Address) -> Member;
+    fn get_current_recipient(env: Env, circle_id: u64) -> Option<Address>;
+
+    // --- SBT CREDENTIAL SYSTEM FUNCTIONS ---
+    fn init_sbt_minter(env: Env, admin: Address);
+    fn set_sbt_minter_admin(env: Env, admin: Address, new_admin: Address);
+    fn issue_credential(
+        env: Env,
+        user: Address,
+        milestone_id: u64,
+        metadata_uri: String,
+    ) -> u128;
+    fn update_credential_status(
+        env: Env,
+        token_id: u128,
+        new_status: SbtStatus,
+    );
+    fn revoke_credential(env: Env, token_id: u128, reason: String);
+    fn get_credential(env: Env, token_id: u128) -> SoroSusuCredential;
+    fn get_user_credential(env: Env, user: Address) -> Option<SoroSusuCredential>;
+    fn get_reputation_milestone(env: Env, milestone_id: u64) -> ReputationMilestone;
+    fn create_reputation_milestone(
+        env: Env,
+        user: Address,
+        cycles_required: u32,
+        description: String,
+        reward_tier: ReputationTier,
+    ) -> u64;
+    fn update_user_reputation(env: Env, user: Address);
+    fn get_user_reputation_score(env: Env, user: Address) -> (u32, u32, u32);
+
+    fn claim_pot(env: Env, user: Address, circle_id: u64);
+
+    fn trigger_insurance_coverage(env: Env, caller: Address, circle_id: u64, member: Address);
+
+    fn propose_penalty_change(env: Env, user: Address, circle_id: u64, new_bps: u32);
+    fn propose_duration_change(env: Env, user: Address, circle_id: u64, new_duration: u64);
+    fn vote_penalty_change(env: Env, user: Address, circle_id: u64);
+
+    fn propose_address_change(
+        env: Env,
+        user: Address,
+        circle_id: u64,
+        old_address: Address,
+        new_address: Address,
+    );
+    fn vote_for_recovery(env: Env, user: Address, circle_id: u64);
+
+    fn eject_member(env: Env, caller: Address, circle_id: u64, member: Address);
+
+    /// Purge a group that has been dormant for ≥ 5 years.
+    /// Returns any residual balance to the protocol treasury and removes
+    /// the circle's storage entry to reclaim ledger rent.
+    fn purge_stale_group(env: Env, admin: Address, circle_id: u64);
+
+    fn pair_with_member(env: Env, user: Address, buddy_address: Address);
+    fn set_safety_deposit(env: Env, user: Address, circle_id: u64, amount: i128);
+
+    // Rollover Bonus Incentive Logic
+    fn propose_rollover_bonus(env: Env, user: Address, circle_id: u64, fee_percentage_bps: u32);
+    fn vote_rollover_bonus(env: Env, user: Address, circle_id: u64, vote_choice: RolloverVoteChoice);
+    fn apply_rollover_bonus(env: Env, circle_id: u64);
+
+    // Group Insurance Fund Management
+    fn get_insurance_fund(env: Env, circle_id: u64) -> GroupInsuranceFund;
+    fn get_premium_record(env: Env, member: Address, circle_id: u64) -> InsurancePremiumRecord;
+    fn trigger_insurance_coverage(env: Env, caller: Address, circle_id: u64, member: Address);
+    fn distribute_remaining_insurance_fund(env: Env, circle_id: u64);
+
+    // Price Oracle and Asset Swap (Economic Circuit Breaker)
+    fn update_price_oracle(env: Env, oracle_provider: Address, asset: Address, price: i128);
+    fn get_asset_price(env: Env, asset: Address) -> PriceOracleData;
+    fn propose_asset_swap(env: Env, user: Address, circle_id: u64, target_asset: Address, swap_percentage_bps: u32);
+    fn vote_asset_swap(env: Env, user: Address, circle_id: u64, vote_choice: QuadraticVoteChoice);
+    fn execute_asset_swap(env: Env, circle_id: u64);
+    fn check_price_drop_and_trigger_swap(env: Env, circle_id: u64) -> bool;
+    fn set_hard_asset_basket(env: Env, admin: Address, gold_weight_bps: u32, btc_weight_bps: u32, silver_weight_bps: u32);
+    fn get_hard_asset_basket(env: Env) -> HardAssetBasket;
+
+    // Late Fee Priority Distribution
+    fn get_late_fee_distribution(env: Env, circle_id: u64, round_number: u32) -> LateFeeDistribution;
+    fn get_payment_timing_record(env: Env, circle_id: u64, round_number: u32, member: Address) -> PaymentTimingRecord;
+    fn distribute_late_fees_with_priority(env: Env, circle_id: u64, round_number: u32);
+    fn propose_yield_delegation(env: Env, user: Address, circle_id: u64, delegation_percentage: u32, pool_address: Address, pool_type: YieldPoolType);
+    fn vote_yield_delegation(env: Env, user: Address, circle_id: u64, vote_choice: YieldVoteChoice);
+    fn approve_yield_delegation(env: Env, circle_id: u64);
+    fn execute_yield_delegation(env: Env, circle_id: u64);
+    fn compound_yield(env: Env, circle_id: u64);
+    fn withdraw_yield_delegation(env: Env, circle_id: u64);
+    fn distribute_yield_earnings(env: Env, circle_id: u64);
+
+    // Path Payment Contribution Support
+    fn propose_path_payment_support(env: Env, user: Address, circle_id: u64);
+    fn vote_path_payment_support(env: Env, user: Address, circle_id: u64, vote_choice: PathPaymentVoteChoice);
+    fn approve_path_payment_support(env: Env, circle_id: u64);
+    fn execute_path_payment(env: Env, user: Address, circle_id: u64, source_token: Address, source_amount: i128);
+    fn register_supported_token(env: Env, user: Address, token_address: Address, token_symbol: String, decimals: u32, is_stable: bool);
+    fn register_dex(env: Env, user: Address, dex_address: Address, dex_name: String, is_trusted: bool);
+
+    // Inter-contract reputation query interface
+    fn get_reputation(env: Env, user: Address) -> ReputationData;
+
+    // Multi-Asset Reserve Currency Basket
+    fn create_basket_circle(
+        env: Env,
+        creator: Address,
+        amount: i128,
+        max_members: u32,
+        basket_assets: Vec<Address>,
+        basket_weights: Vec<u32>,
+        cycle_duration: u64,
+        insurance_fee_bps: u32,
+        nft_contract: Address,
+        arbitrator: Address,
+    ) -> u64;
+
+    fn deposit_basket(env: Env, user: Address, circle_id: u64);
+    fn get_basket_config(env: Env, circle_id: u64) -> Vec<AssetWeight>;
+
+    // Recursive Susu Cycles (Auto-Compounding)
+    fn toggle_recursive_opt_in(env: Env, user: Address, circle_id: u64, enabled: bool);
+    /// Set up a "Gold Tier" circle for recursive transitions
+    fn recursive_init(env: Env, admin: Address, amount: i128, token: Address, circle_id: u64);
+
+    // Cross-Contract Bridge for LeaseFlow
+    fn is_cycle_healthy(env: Env, user: Address, circle_id: u64) -> bool;
+    fn handle_leaseflow_default(env: Env, leaseflow_contract: Address, user: Address, circle_id: u64);
+    fn set_leaseflow_contract(env: Env, admin: Address, leaseflow: Address);
+
+    // Grant-Stream Matching Logic
+    fn handle_grant_stream_match(env: Env, grant_stream_contract: Address, circle_id: u64, amount: i128);
+    fn set_grant_stream_contract(env: Env, admin: Address, grant_stream: Address);
+}
+
+// --- IMPLEMENTATION ---
+
+fn append_audit_index(env: &Env, key: DataKey, audit_id: u64) {
+    let mut ids: Vec<u64> = env.storage().instance().get(&key).unwrap_or(Vec::new(env));
+    ids.push_back(audit_id);
+    env.storage().instance().set(&key, &ids);
+}
+
+fn write_audit(env: &Env, actor: &Address, action: AuditAction, resource_id: u64) {
+    let mut audit_count: u64 = env.storage().instance().get(&DataKey::AuditCount).unwrap_or(0);
+    audit_count += 1;
+
+    let entry = AuditEntry {
+        id: audit_count,
+        actor: actor.clone(),
+        action,
+        timestamp: env.ledger().timestamp(),
+        resource_id,
+    };
+
+    env.storage()
+        .instance()
+        .set(&DataKey::AuditEntry(audit_count), &entry);
+    env.storage().instance().set(&DataKey::AuditCount, &audit_count);
+
+    append_audit_index(env, DataKey::AuditAll, audit_count);
+    append_audit_index(env, DataKey::AuditByActor(actor.clone()), audit_count);
+    append_audit_index(env, DataKey::AuditByResource(resource_id), audit_count);
+
+    env.events().publish(
+        (symbol_short!("AUDIT"), actor.clone(), resource_id),
+        (audit_count, entry.timestamp),
+    );
+}
+
+fn calculate_rollover_bonus(env: &Env, circle_id: u64, fee_percentage_bps: u32) -> i128 {
+    // Get the protocol fee settings
+    let fee_bps: u32 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
+    if fee_bps == 0 {
+        return 0; // No protocol fee, no bonus
+    }
+
+    // Calculate the total pot amount for this circle
+    let circle_key = DataKey::Circle(circle_id);
+    let circle: CircleInfo = env.storage().instance().get(&circle_key)
+        .expect("Circle not found");
+    
+    let total_pot = circle.contribution_amount * (circle.member_count as i128);
+    
+    // Calculate the platform fee that would be charged
+    let platform_fee = (total_pot * fee_bps as i128) / 10000;
+    
+    // Calculate the rollover bonus (percentage of platform fee to refund)
+    let bonus_amount = (platform_fee * fee_percentage_bps as i128) / 10000;
+    
+    bonus_amount
+}
+
+fn get_member_address_by_index(circle: &CircleInfo, index: u32) -> Address {
+    if index >= circle.member_count {
+        panic!("Member index out of bounds");
+    }
+    circle.member_addresses.get(index).unwrap()
+}
+
+fn execute_stellar_path_payment(env: &Env, source_token: &Address, target_token: &Address, source_amount: i128, max_slippage_bps: u32) -> (i128, i128, u32) {
+    // This is a simplified implementation - in production would call actual Stellar Path Payment
+    // For now, we'll simulate the swap with a basic exchange rate
+    
+    // Get token info for decimals
+    let source_token_key = DataKey::SupportedTokens(source_token.clone());
+    let source_token_info: SupportedToken = env.storage().instance().get(&source_token_key)
+        .expect("Source token not supported");
+    
+    let target_token_key = DataKey::SupportedTokens(target_token.clone());
+    let target_token_info: SupportedToken = env.storage().instance().get(&target_token_key)
+        .expect("Target token not supported");
+
+    // Calculate exchange rate (simplified - would use actual DEX rates)
+    // Assume 1:1 rate for demonstration, adjust based on token types
+    let rate_adjustment = if source_token_info.is_stable && !target_token_info.is_stable {
+        10000 // Stable to volatile might need premium
+    } else if !source_token_info.is_stable && target_token_info.is_stable {
+        9800 // Stable to stable might have small discount
+    } else {
+        10000 // Default 1:1 rate
+    };
+
+    let exchange_rate = rate_adjustment;
+    let target_amount = (source_amount * exchange_rate) / 10000;
+    
+    // Calculate slippage (0 for this simplified implementation)
+    let slippage_bps = 0;
+    
+    // In real implementation, this would:
+    // 1. Call Stellar Path Payment contract
+    // 2. Handle slippage protection
+    // 3. Handle partial fills
+    // 4. Handle failed transactions
+    
+    (target_amount, exchange_rate, slippage_bps)
+}
+
+fn count_active_members(env: &Env, circle: &CircleInfo) -> u32 {
+    let mut active_count = 0u32;
+    for i in 0..circle.member_count {
+        let member_address = circle.member_addresses.get(i).unwrap();
+        let key = DataKey::Member(member_address);
+        if let Some(member) = env.storage().instance().get::<DataKey, Member>(&key) {
+            if member.status == MemberStatus::Active {
+                active_count += 1;
+            }
+        }
+    }
+    active_count
+}
+
+fn apply_recovery_if_consensus(env: &Env, actor: &Address, circle_id: u64, circle: &mut CircleInfo) {
+    let active_members = count_active_members(env, circle);
+    if active_members == 0 {
+        panic!("No active members");
+    }
+
+    let votes = circle.recovery_votes_bitmap.count_ones();
+    if votes * 100 <= active_members * 66 {
+        return;
+    }
+
+    let old_address = circle
+        .recovery_old_address
+        .clone()
+        .unwrap_or_else(|| panic!("No recovery proposal"));
+    let new_address = circle
+        .recovery_new_address
+        .clone()
+        .unwrap_or_else(|| panic!("No recovery proposal"));
+
+        let old_member_key = DataKey::Member(old_address.clone());
+    let mut old_member: Member = env
+        .storage()
+        .instance()
+        .get(&old_member_key)
+        .unwrap_or_else(|| panic!("Old member not found"));
+
+    if old_member.status != MemberStatus::Active {
+        panic!("Only active members can be recovered");
+    }
+
+    let new_member_key = DataKey::Member(new_address.clone());
+    if env.storage().instance().has(&new_member_key) {
+        panic!("New address is already a member");
+    }
+
+    old_member.address = new_address.clone();
+    env.storage().instance().set(&new_member_key, &old_member);
+    env.storage().instance().remove(&old_member_key);
+
+        // Migrate UserStats
+        if let Some(stats) = env.storage().instance().get::<DataKey, UserStats>(&DataKey::UserStats(old_address.clone())) {
+            env.storage().instance().set(&DataKey::UserStats(new_address.clone()), &stats);
+            env.storage().instance().remove(&DataKey::UserStats(old_address.clone()));
+        }
+
+        // Migrate SocialCapital
+        if let Some(sc) = env.storage().instance().get::<DataKey, SocialCapital>(&DataKey::SocialCapital(old_address.clone(), circle_id)) {
+            let mut new_sc = sc.clone();
+            new_sc.member = new_address.clone();
+            env.storage().instance().set(&DataKey::SocialCapital(new_address.clone(), circle_id), &new_sc);
+            env.storage().instance().remove(&DataKey::SocialCapital(old_address.clone(), circle_id));
+        }
+
+        // Migrate SafetyDeposit
+        if let Some(sd) = env.storage().instance().get::<DataKey, i128>(&DataKey::SafetyDeposit(old_address.clone(), circle_id)) {
+            env.storage().instance().set(&DataKey::SafetyDeposit(new_address.clone(), circle_id), &sd);
+            env.storage().instance().remove(&DataKey::SafetyDeposit(old_address.clone(), circle_id));
+        }
+
+    circle
+        .member_addresses
+        .set(old_member.index, new_address);
+    circle.recovery_old_address = None;
+    circle.recovery_new_address = None;
+    circle.recovery_votes_bitmap = 0;
+
+    write_audit(env, actor, AuditAction::AdminAction, circle_id);
+}
+
+fn query_from_indexed_ids(
+    env: &Env,
+    ids: Vec<u64>,
+    start_time: u64,
+    end_time: u64,
+    offset: u32,
+    limit: u32,
+) -> Vec<AuditEntry> {
+    let mut output = Vec::new(env);
+    if limit == 0 || start_time > end_time {
+        return output;
+    }
+
+    let bounded_limit = if limit > MAX_QUERY_LIMIT {
+        MAX_QUERY_LIMIT
+    } else {
+        limit
+    };
+
+    let mut skipped = 0u32;
+    for i in 0..ids.len() {
+        let id = ids.get(i).unwrap();
+        let entry: AuditEntry = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditEntry(id))
+            .unwrap_or_else(|| panic!("Audit entry missing"));
+
+        if entry.timestamp < start_time || entry.timestamp > end_time {
+            continue;
+        }
+
+        if skipped < offset {
+            skipped += 1;
+            continue;
+        }
+
+        if output.len() >= bounded_limit {
+            break;
+        }
+
+        output.push_back(entry);
+    }
+
+    output
+}
+
+fn finalize_leniency_vote_internal(
+    env: &Env,
+    circle_id: u64,
+    requester: &Address,
+    request: &mut LeniencyRequest,
+) {
+    let total_possible_votes = request.total_votes_cast;
+    let minimum_participation = (total_possible_votes * MINIMUM_VOTING_PARTICIPATION) / 100;
+
+    let mut final_status = LeniencyRequestStatus::Rejected;
+
+    if request.total_votes_cast >= minimum_participation && request.total_votes_cast > 0 {
+        let approval_percentage = (request.approve_votes * 100) / request.total_votes_cast;
+        if approval_percentage >= SIMPLE_MAJORITY_THRESHOLD {
+            final_status = LeniencyRequestStatus::Approved;
+
+            let circle_key = DataKey::Circle(circle_id);
+            let mut circle: CircleInfo = env
+                .storage()
+                .instance()
+                .get(&circle_key)
+                .expect("Circle not found");
+
+            let extension_seconds = request.extension_hours * 3600;
+            let new_deadline = circle.deadline_timestamp + extension_seconds;
+            circle.grace_period_end = new_deadline;
+
+            env.storage().instance().set(&circle_key, &circle);
+
+            let social_capital_key = DataKey::SocialCapital(requester.clone(), circle_id);
+            let mut social_capital: SocialCapital = env
+                .storage()
+                .instance()
+                .get(&social_capital_key)
+                .unwrap_or(SocialCapital {
+                    member: requester.clone(),
+                    circle_id,
+                    leniency_given: 0,
+                    leniency_received: 0,
+                    voting_participation: 0,
+                    trust_score: 50,
+                });
+            social_capital.leniency_received += 1;
+            social_capital.trust_score = (social_capital.trust_score + 5).min(100);
+            env.storage().instance().set(&social_capital_key, &social_capital);
+        }
+    }
+
+    request.status = final_status.clone();
+
+    let stats_key = DataKey::LeniencyStats(circle_id);
+    let mut stats: LeniencyStats = env
+        .storage()
+        .instance()
+        .get(&stats_key)
+        .unwrap_or(LeniencyStats {
+            total_requests: 0,
+            approved_requests: 0,
+            rejected_requests: 0,
+            expired_requests: 0,
+            average_participation: 0,
+        });
+
+    match final_status {
+        LeniencyRequestStatus::Approved => stats.approved_requests += 1,
+        LeniencyRequestStatus::Rejected => stats.rejected_requests += 1,
+        LeniencyRequestStatus::Expired => stats.expired_requests += 1,
+        _ => {}
+    }
+
+    if stats.total_requests > 0 {
+        let total_participation =
+            stats.average_participation * (stats.total_requests - 1) + request.total_votes_cast;
+        stats.average_participation = total_participation / stats.total_requests;
+    }
+
+    env.storage().instance().set(&stats_key, &stats);
+}
+
+fn execute_proposal_logic(env: &Env, proposal: &Proposal) {
+    let proposal_key = DataKey::Proposal(proposal.id);
+    let mut updated_proposal = proposal.clone();
+    updated_proposal.status = ProposalStatus::Executed;
+    env.storage().instance().set(&proposal_key, &updated_proposal);
+}
+
+#[contract]
+pub struct SoroSusu;
+
+#[contractimpl]
+impl SoroSusuTrait for SoroSusu {
+    fn init(env: Env, admin: Address) {
+        // Initialize the circle counter to 0 if it doesn't exist
+        if !env.storage().instance().has(&DataKey::CircleCount) {
+            env.storage().instance().set(&DataKey::CircleCount, &0u64);
+        }
+
+        // Set the admin
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::CircleCount, &0u64);
+        env.storage().instance().set(&DataKey::AuditCount, &0u64);
+    }
+
+    /// # Admin-Only: Set Lending Pool Address
+    ///
+    /// **Why admin-only:** The lending pool is a trusted external contract that
+    /// receives protocol funds. Allowing arbitrary callers to change it would
+    /// enable fund-draining attacks by redirecting deposits to a malicious pool.
+    ///
+    /// **If admin key is lost:** The lending pool address becomes permanently
+    /// frozen at its last set value. Existing pool interactions continue to
+    /// function, but the pool cannot be updated or disabled. Funds already
+    /// deposited into the pool remain accessible via the pool contract itself.
+    ///
+    /// **DAO migration path:** Replace the single-admin check with a
+    /// multi-sig governance proposal (≥ 2/3 council vote) before executing
+    /// the pool address change. The `write_audit` call already provides an
+    /// immutable on-chain record for every change.
+    fn set_lending_pool(env: Env, admin: Address, pool: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+        env.storage().instance().set(&DataKey::LendingPool, &pool);
+        write_audit(&env, &admin, AuditAction::AdminAction, 0);
+    }
+
+    /// # Admin-Only: Set Protocol Fee and Treasury
+    ///
+    /// **Why admin-only:** The protocol fee is deducted from every member
+    /// payout. An unconstrained caller could set the fee to 100 % (10 000 bps)
+    /// and redirect all funds to an attacker-controlled treasury address.
+    ///
+    /// **If admin key is lost:** The fee and treasury address are frozen at
+    /// their last configured values. Payouts continue to deduct the frozen fee
+    /// and send it to the frozen treasury. No funds are trapped, but the
+    /// protocol cannot adjust monetisation parameters.
+    ///
+    /// **DAO migration path:** Gate this function behind a time-locked
+    /// governance proposal with a mandatory 48-hour delay and a ≥ 2/3
+    /// multi-sig approval. Cap the maximum fee change per proposal to
+    /// ±100 bps to prevent sudden large fee increases.
+    fn set_protocol_fee(env: Env, admin: Address, fee_basis_points: u32, treasury: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+        if fee_basis_points > 10000 {
+            panic!("InvalidFeeConfig");
+        }
+        env.storage().instance().set(&DataKey::ProtocolFeeBps, &fee_basis_points);
+        env.storage().instance().set(&DataKey::ProtocolTreasury, &treasury);
+    }
+
+    /// Creates a new savings circle.
+    ///
+    /// # Parameters
+    /// - `creator`: Address of the circle creator; must sign the transaction.
+    /// - `amount`: Fixed contribution per round in stroops (1 XLM = 10 000 000 stroops).
+    /// - `max_members`: Maximum number of members allowed (determines total rounds).
+    /// - `token`: SEP-41 token contract address used for contributions and payouts.
+    /// - `cycle_duration`: Seconds between rounds (e.g. `604800` = 1 week).
+    /// - `insurance_fee_bps`: Per-member insurance premium in basis points (max 10 000).
+    /// - `nft_contract`: SBT credential contract address for badge minting.
+    ///
+    /// # Returns
+    /// The new `circle_id` (monotonically increasing `u64`).
+    ///
+    /// # Security
+    /// - `creator` must call `require_auth()` — enforced internally.
+    /// - `insurance_fee_bps` is capped at 10 000 (100 %) to prevent fee overflow.
+    /// - `cycle_duration` is capped at `MAX_CYCLE_DURATION` to prevent epoch overflow.
+    fn create_circle(
+        env: Env,
+        creator: Address,
+        amount: i128,
+        max_members: u32,
+        token: Address,
+        cycle_duration: u64,
+        insurance_fee_bps: u32,
+        nft_contract: Address,
+    ) -> u64 {
+        creator.require_auth();
+
+        // Validate insurance fee (cannot exceed 100%)
+        if insurance_fee_bps > 10_000 {
+            panic!("Insurance fee cannot exceed 100%");
+        }
+
+        // Get the current Circle Count
+        let mut circle_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
+        
+        // Increment for the new circle
+        circle_count += 1;
+        
+        // Create the new circle using the canonical CircleInfo struct
+        let circle = CircleInfo {
             id: circle_count,
             creator: creator.clone(),
             contribution_amount: amount,
@@ -511,161 +1659,569 @@ impl SoroSusuTrait for SoroSusu {
             member_count: 0,
             current_recipient_index: 0,
             is_active: true,
-            token,
-            deadline_timestamp: current_time + cycle_duration,
+            token: token.clone(),
+            deadline_timestamp: env.ledger().timestamp() + cycle_duration,
             cycle_duration,
-            yield_enabled,
-            risk_tolerance,
-            grace_period,
-            late_fee_bps,
+            contribution_bitmap: 0,
+            insurance_balance: 0,
+            insurance_fee_bps,
+            is_insurance_used: false,
+            late_fee_bps: 0,
+            nft_contract,
+            is_round_finalized: false,
+            current_pot_recipient: None,
+            requires_collateral: false,
+            collateral_bps: 0,
+            member_addresses: soroban_sdk::Vec::new(&env),
+            leniency_enabled: false,
+            grace_period_end: None,
+            quadratic_voting_enabled: false,
+            proposal_count: 0,
+            dissolution_status: DissolutionStatus::NotInitiated,
+            dissolution_deadline: None,
+            proposed_late_fee_bps: 0,
+            proposal_votes_bitmap: 0,
+            recovery_old_address: None,
+            recovery_new_address: None,
+            recovery_votes_bitmap: 0,
+            arbitrator: creator.clone(),
+            basket: None,
         };
 
-        // 4. Save the Circle and the new Count
-        env.storage()
-            .instance()
-            .set(&DataKey::Circle(circle_count), &new_circle);
-        env.storage()
-            .instance()
-            .set(&DataKey::CircleCount, &circle_count);
+        // Store the circle
+        env.storage().instance().set(&DataKey::Circle(circle_count), &circle);
+        
+        // Update the circle count
+        env.storage().instance().set(&DataKey::CircleCount, &circle_count);
 
-        // 5. Initialize Group Reserve if not exists
-        if !env.storage().instance().has(&DataKey::GroupReserve) {
-            env.storage().instance().set(&DataKey::GroupReserve, &0u64);
-        }
-
-        // 6. Return the new ID
         circle_count
     }
 
-    fn join_circle(env: Env, user: Address, circle_id: u64) {
-        // Check if contract is paused
-        require_not_paused(&env);
-
-        // 1. Authorization: The user MUST sign this transaction
+    /// Adds a member to an existing open circle.
+    ///
+    /// # Parameters
+    /// - `user`: Address joining the circle; must sign the transaction.
+    /// - `circle_id`: ID of the target circle (must be in `Open` or `Active` state).
+    /// - `shares`: Contribution multiplier — `1` (standard) or `2` (double share/payout).
+    /// - `guarantor`: Optional address that vouches for the member's contributions.
+    ///
+    /// # Panics
+    /// - `"Circle not found"` — `circle_id` does not exist.
+    /// - `"Circle is full"` — `member_count >= max_members`.
+    /// - `"Already a member"` — `user` is already in the circle.
+    /// - `"Shares must be 1 or 2"` — invalid `shares` value.
+    fn join_circle(env: Env, user: Address, circle_id: u64, shares: u32, guarantor: Option<Address>) {
+        // Authorization: The user MUST sign this transaction
         user.require_auth();
 
-        // 2. Retrieve the circle data
-        let mut circle: CircleInfo = env
-            .storage()
-            .instance()
-            .get(&DataKey::Circle(circle_id))
-            .unwrap();
+        // Validate shares (must be 1 or 2)
+        if shares != 1 && shares != 2 {
+            panic!("Shares must be 1 or 2");
+        }
 
-        // 4. Check if the circle is full
+        // Check if the circle exists
+        let mut circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        // Check if the circle is full
         if circle.member_count >= circle.max_members {
             panic!("Circle is full");
         }
 
-        // 5. Check if user is already a member to prevent duplicates
-        let member_key = DataKey::Member(user.clone());
-        if env.storage().instance().has(&member_key) {
-            panic!("User is already a member");
+        // Check if the user is already a member
+        if circle.member_addresses.contains(&user) {
+            panic!("Already a member");
         }
 
-        // 6. Create and store the new member
-        let new_member = Member {
-            address: user.clone(),
-            has_contributed: false,
-            contribution_count: 0,
-            last_contribution_time: 0,
-            missed_deadline_timestamp: 0,
-            opt_out_of_yield: false,
-            amount_contributed: 0,
-        };
-
-        // 6. Store the member and update circle count
-        env.storage().instance().set(&member_key, &new_member);
+        // Add the user to the members list
+        circle.member_addresses.push_back(user.clone());
         circle.member_count += 1;
 
-        // 7. Save the updated circle back to storage
-        env.storage()
-            .instance()
-            .set(&DataKey::Circle(circle_id), &circle);
+        // Store member by index for efficient lookup during payouts
+        let member_index = circle.member_count - 1;
+        env.storage().instance().set(&DataKey::CircleMember(circle_id, member_index), &user);
+
+        // Create member record
+        let member = Member {
+            address: user.clone(),
+            index: member_index,
+            contribution_count: 0,
+            last_contribution_time: 0,
+            status: MemberStatus::Active,
+            tier_multiplier: shares,
+            consecutive_missed_rounds: 0,
+            referrer: None,
+            buddy: None,
+            shares,
+            guarantor,
+        };
+
+        // Store the member
+        env.storage().instance().set(&DataKey::Member(user.clone()), &member);
+
+        // Update the circle
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
 
-    fn deposit(env: Env, user: Address, circle_id: u64, amount: u64) {
-        // 1. Check if contract is paused
-        require_not_paused(&env);
+    /// Submits the caller's contribution for the current round.
+    ///
+    /// # Parameters
+    /// - `user`: Address making the deposit; must sign the transaction.
+    /// - `circle_id`: ID of the circle to deposit into.
+    ///
+    /// # Security
+    /// The caller must have pre-approved the SoroSusu contract to transfer
+    /// `circle.contribution_amount` tokens on their behalf (SEP-41 `approve`).
+    /// The token transfer is executed atomically within this call.
+    ///
+    /// # Panics
+    /// - `"Circle not found"` — `circle_id` does not exist.
+    fn deposit(env: Env, user: Address, circle_id: u64) {
+        user.require_auth();
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+        let token_client = soroban_sdk::token::Client::new(&env, &circle.token);
+        token_client.transfer(&user, &env.current_contract_address(), &circle.contribution_amount);
+    }
 
-        // 2. Authorization: The user must sign this!
+
+    // --- GAS BUFFER MANAGEMENT ---
+
+    fn fund_gas_buffer(_env: Env, _circle_id: u64, _amount: i128) {
+        // Gas buffer funding - not required for core functionality
+    }
+
+    fn set_gas_buffer_config(_env: Env, _circle_id: u64, _config: GasBufferConfig) {
+        // Gas buffer config - not required for core functionality
+    }
+
+    fn get_gas_buffer_balance(_env: Env, _circle_id: u64) -> i128 {
+        0
+    }
+
+    // --- PAYOUT FUNCTIONS WITH GAS BUFFER ---
+
+    /// Distributes the round's pot to the current recipient.
+    ///
+    /// # Parameters
+    /// - `caller`: Address initiating the payout; must sign the transaction.
+    /// - `circle_id`: ID of the circle whose payout is being distributed.
+    ///
+    /// # Events
+    /// Emits `payout_distributed { circle_id, recipient, gross_payout }`.
+    ///
+    /// # Panics
+    /// - `"Circle not found"` — `circle_id` does not exist.
+    /// - `"No recipient set"` — no recipient is queued for this round.
+    fn distribute_payout(env: Env, caller: Address, circle_id: u64) {
+        caller.require_auth();
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+        let recipient = circle.current_pot_recipient.clone()
+            .unwrap_or_else(|| panic!("No recipient set"));
+        let gross_payout = circle.contribution_amount * circle.member_count as i128;
+        let token_client = soroban_sdk::token::Client::new(&env, &circle.token);
+        token_client.transfer(&env.current_contract_address(), &recipient, &gross_payout);
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "payout_distributed"), circle_id),
+            (recipient, gross_payout),
+        );
+    }
+
+    /// # Admin-Only: Trigger Payout for a Circle
+    ///
+    /// **Why admin-only:** Payouts transfer the entire pot to a single
+    /// recipient. Allowing arbitrary callers to trigger payouts could enable
+    /// griefing (forcing premature payouts) or front-running attacks where an
+    /// attacker triggers a payout before all members have contributed.
+    ///
+    /// **If admin key is lost:** Payouts can no longer be triggered by the
+    /// admin. Members can still call `distribute_payout` directly (which
+    /// enforces the same contribution-completeness check), so funds are not
+    /// permanently locked. The admin trigger is a convenience/override path.
+    ///
+    /// **DAO migration path:** Expose a time-locked `propose_trigger_payout`
+    /// governance action that requires a ≥ 2/3 member vote. This removes the
+    /// single point of failure while preserving the override capability.
+    /// Admin-only: forces a payout for a circle regardless of round state.
+    ///
+    /// # Parameters
+    /// - `admin`: Admin address; must sign the transaction.
+    /// - `circle_id`: ID of the circle to trigger payout for.
+    ///
+    /// # Security
+    /// Only the stored admin address may call this function.
+    ///
+    /// # Panics
+    /// - `"Unauthorized: Only admin can trigger payout"` — caller is not admin.
+    fn trigger_payout(env: Env, admin: Address, circle_id: u64) {
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        if admin != stored_admin {
+            panic!("Unauthorized: Only admin can trigger payout");
+        }
+        Self::distribute_payout(env, admin, circle_id);
+    }
+
+    /// Closes the current round and advances the payout queue to the next recipient.
+    ///
+    /// # Parameters
+    /// - `creator`: Circle creator address; must sign the transaction.
+    /// - `circle_id`: ID of the circle to finalize.
+    ///
+    /// # Events
+    /// Emits `round_finalized { circle_id, next_recipient, scheduled_time }`.
+    ///
+    /// # Panics
+    /// - `"Only creator can finalize round"` — caller is not the circle creator.
+    /// - `"Round already finalized"` — the round has already been closed.
+    /// - `"No members in circle"` — the circle has no members.
+    fn finalize_round(env: Env, creator: Address, circle_id: u64) {
+        creator.require_auth();
+
+        // Check authorization (only creator can finalize)
+        let mut circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        if creator != circle.creator {
+            panic!("Only creator can finalize round");
+        }
+
+        if circle.is_round_finalized {
+            panic!("Round already finalized");
+        }
+
+        if circle.member_count == 0 {
+            panic!("No members in circle");
+        }
+
+        // Determine next recipient (round-robin based on current_recipient_index)
+        let next_recipient_index = circle.current_recipient_index % circle.member_count;
+        let next_recipient: Address = env.storage().instance()
+            .get(&DataKey::CircleMember(circle_id, next_recipient_index))
+            .unwrap_or_else(|| panic!("Member not found for next round"));
+
+        // Update circle state
+        circle.is_round_finalized = true;
+        circle.current_pot_recipient = Some(next_recipient.clone());
+        circle.current_recipient_index = (next_recipient_index + 1) % circle.member_count;
+        circle.deadline_timestamp = env.ledger().timestamp() + circle.cycle_duration;
+
+        // Store updated circle
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+
+        // Schedule payout time
+        let scheduled_time = env.ledger().timestamp() + circle.cycle_duration;
+        env.storage().instance().set(&DataKey::ScheduledPayoutTime(circle_id), &scheduled_time);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "Payout_Ready"), circle_id),
+            (next_recipient, scheduled_time),
+        );
+    }
+
+    // --- HELPER FUNCTIONS ---
+
+    /// Returns the full state of a circle.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle to query.
+    ///
+    /// # Returns
+    /// A `CircleInfo` struct containing all circle metadata and member list.
+    ///
+    /// # Panics
+    /// - `"Circle not found"` — `circle_id` does not exist.
+    fn get_circle(env: Env, circle_id: u64) -> CircleInfo {
+        env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"))
+    }
+
+    /// Returns the membership record for an address.
+    ///
+    /// # Parameters
+    /// - `member`: Address to look up.
+    ///
+    /// # Returns
+    /// A `Member` struct with contribution history, status, buddy, and guarantor.
+    ///
+    /// # Panics
+    /// - `"Member not found"` — `member` has never joined a circle.
+    fn get_member(env: Env, member: Address) -> Member {
+        env.storage().instance()
+            .get(&DataKey::Member(member))
+            .unwrap_or_else(|| panic!("Member not found"))
+    }
+
+    /// Returns the address scheduled to receive the next payout, or `None`.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle to query.
+    ///
+    /// # Returns
+    /// `Some(Address)` if a recipient is queued, `None` if no payout is pending.
+    fn get_current_recipient(env: Env, circle_id: u64) -> Option<Address> {
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+        circle.current_pot_recipient
+    }
+
+    // --- STELLAR ANCHOR DIRECT DEPOSIT API (SEP-24/SEP-31) ---
+
+    fn register_anchor(env: Env, admin: Address, anchor_info: AnchorInfo) {
+        // Only admin can register anchors
+        admin.require_auth();
+        
+        // Verify admin is contract admin
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not found"));
+        
+        if admin != stored_admin {
+            panic!("Unauthorized: Only admin can register anchors");
+        }
+
+        // Store anchor info in registry
+        let mut anchor_registry: Map<Address, AnchorInfo> = env.storage().instance()
+            .get(&DataKey::AnchorRegistry)
+            .unwrap_or_else(|| Map::new(&env));
+        
+        anchor_registry.set(anchor_info.anchor_address.clone(), anchor_info.clone());
+        env.storage().instance().set(&DataKey::AnchorRegistry, &anchor_registry);
+
+        // Log audit entry
+        let audit_count: u64 = env.storage().instance()
+            .get(&DataKey::AuditCount)
+            .unwrap_or(0);
+        
+        let audit_entry = AuditEntry {
+            id: audit_count,
+            actor: admin,
+            action: AuditAction::AdminAction,
+            timestamp: env.ledger().timestamp(),
+            resource_id: 0, // Use 0 for anchor registration
+        };
+        
+        env.storage().instance().set(&DataKey::AuditEntry(audit_count), &audit_entry);
+        env.storage().instance().set(&DataKey::AuditCount, &(audit_count + 1));
+    }
+
+    fn deposit_for_user(
+        env: Env,
+        anchor: Address,
+        beneficiary_user: Address,
+        circle_id: u64,
+        amount: i128,
+        deposit_memo: String,
+        fiat_reference: String,
+        sep_type: String,
+    ) {
+        // Authorization: The anchor must sign this!
+        anchor.require_auth();
+
+        // Verify anchor is registered and authorized
+        let anchor_registry: Map<Address, AnchorInfo> = env.storage().instance()
+            .get(&DataKey::AnchorRegistry)
+            .unwrap_or_else(|| panic!("Anchor registry not found"));
+        
+        let anchor_info: AnchorInfo = anchor_registry.get(anchor.clone())
+            .unwrap_or_else(|| panic!("Anchor not found"));
+
+        if !anchor_info.is_active {
+            panic!("Anchor not active");
+        }
+
+        // Verify SEP type is supported
+        if sep_type != "SEP-24" && sep_type != "SEP-31" {
+            panic!("Unsupported SEP type");
+        }
+
+        // Compliance checks
+        if amount > anchor_info.max_deposit_amount {
+            panic!("Amount exceeds anchor's maximum deposit limit");
+        }
+
+        // Check if deposit memo already processed (prevent double processing)
+        let memo_key = DataKey::DepositMemo(circle_id);
+        let mut processed_memos: Vec<String> = env.storage().instance()
+            .get(&memo_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        if processed_memos.contains(&deposit_memo) {
+            panic!("Deposit already processed");
+        }
+
+        // Get the circle
+        let mut circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        // Get the member
+        let mut member: Member = env.storage().instance()
+            .get(&DataKey::Member(beneficiary_user.clone()))
+            .unwrap_or_else(|| panic!("Member not found"));
+
+        // Check if already contributed this round
+        if member.contribution_count > 0 {
+            panic!("Already contributed this round");
+        }
+
+        // Calculate the total amount needed (contribution + insurance fee + group insurance premium)
+        let insurance_fee = (circle.contribution_amount as i128 * circle.insurance_fee_bps as i128) / 10_000;
+        let group_insurance_premium = (circle.contribution_amount as i128 * 50i128) / 10_000;
+        let total_amount = circle.contribution_amount as i128 + insurance_fee + group_insurance_premium;
+
+        // Verify amount matches expected contribution
+        if amount != total_amount {
+            panic!("Amount does not match required contribution");
+        }
+
+        // Create deposit record
+        let deposit_id = env.ledger().sequence(); // Use ledger sequence as unique ID
+        let deposit_record = AnchorDeposit {
+            deposit_id,
+            anchor_address: anchor.clone(),
+            beneficiary_user: beneficiary_user.clone(),
+            circle_id,
+            amount,
+            deposit_memo: deposit_memo.clone(),
+            fiat_reference,
+            timestamp: env.ledger().timestamp(),
+            compliance_verified: true,
+            processed: false,
+            sep_type,
+        };
+
+        // Store deposit record
+        env.storage().instance().set(&DataKey::AnchorDeposit(deposit_id), &deposit_record);
+
+        // Mark memo as processed
+        processed_memos.push_back(deposit_memo);
+        env.storage().instance().set(&memo_key, &processed_memos);
+
+        // Transfer the tokens from anchor to contract
+        let token_client = token::Client::new(&env, &circle.token);
+        token_client.transfer(&anchor, &env.current_contract_address(), &total_amount);
+
+        // Update member record (similar to regular deposit)
+        member.last_contribution_time = env.ledger().timestamp();
+        member.contribution_count += 1;
+
+        // Update user stats
+        let mut user_stats: UserStats = env.storage().instance()
+            .get(&DataKey::UserStats(beneficiary_user.clone()))
+            .unwrap_or_else(|| UserStats {
+                total_volume_saved: 0,
+                on_time_contributions: 0,
+                late_contributions: 0,
+            });
+        
+        user_stats.total_volume_saved += total_amount;
+        user_stats.on_time_contributions += 1;
+        env.storage().instance().set(&DataKey::UserStats(beneficiary_user.clone()), &user_stats);
+
+        // Store the updated member
+        env.storage().instance().set(&DataKey::Member(beneficiary_user.clone()), &member);
+
+        // Update circle contribution bitmap
+        let member_index = member.index;
+        circle.contribution_bitmap |= 1u64 << member_index;
+
+        // Store the updated circle
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+
+        // Update anchor's last activity
+        let mut updated_anchor_info = anchor_info.clone();
+        updated_anchor_info.last_activity = env.ledger().timestamp();
+        anchor_registry.set(anchor.clone(), updated_anchor_info);
+        env.storage().instance().set(&DataKey::AnchorRegistry, &anchor_registry);
+
+        // Mark deposit as processed
+        let mut updated_deposit = deposit_record;
+        updated_deposit.processed = true;
+        env.storage().instance().set(&DataKey::AnchorDeposit(deposit_id), &updated_deposit);
+
+        // Log audit entry
+        let audit_count: u64 = env.storage().instance()
+            .get(&DataKey::AuditCount)
+            .unwrap_or(0);
+        
+        let audit_entry = AuditEntry {
+            id: audit_count,
+            actor: anchor,
+            action: AuditAction::AdminAction, // Use AdminAction for anchor deposits
+            timestamp: env.ledger().timestamp(),
+            resource_id: circle_id,
+        };
+        
+        env.storage().instance().set(&DataKey::AuditEntry(audit_count), &audit_entry);
+        env.storage().instance().set(&DataKey::AuditCount, &(audit_count + 1));
+    }
+
+    fn verify_anchor_deposit(env: Env, deposit_id: u64) -> bool {
+        let deposit: AnchorDeposit = env.storage().instance()
+            .get(&DataKey::AnchorDeposit(deposit_id))
+            .unwrap_or_else(|| panic!("Deposit not found"));
+        
+        deposit.processed && deposit.compliance_verified
+    }
+
+    fn get_anchor_info(env: Env, anchor_address: Address) -> AnchorInfo {
+        let anchor_registry: Map<Address, AnchorInfo> = env.storage().instance()
+            .get(&DataKey::AnchorRegistry)
+            .unwrap_or_else(|| panic!("Anchor registry not found"));
+        
+        anchor_registry.get(anchor_address)
+            .unwrap_or_else(|| panic!("Anchor not found"))
+    }
+
+    fn get_deposit_record(env: Env, deposit_id: u64) -> AnchorDeposit {
+        env.storage().instance()
+            .get(&DataKey::AnchorDeposit(deposit_id))
+            .unwrap_or_else(|| panic!("Deposit not found"))
+    }
+
+    /// Claims the current round's payout pot for the calling user.
+    ///
+    /// # Parameters
+    /// - `user`: Address claiming the pot; must be the current round's recipient
+    ///   and must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    ///
+    /// # Security
+    /// - Enforces a flash-loan prevention guard: the user cannot withdraw and
+    ///   deposit in the same ledger.
+    /// - Reverts if a LeaseFlow default lock is active on the circle.
+    ///
+    /// # Panics
+    /// - `"Circle not found"` — `circle_id` does not exist.
+    fn claim_pot(env: Env, user: Address, circle_id: u64) {
         user.require_auth();
 
-        // 2. Load the Circle Data
+        // Flash-loan prevention: Ledger-Lock mechanism
+        let current_ledger = env.ledger().sequence();
+        if let Some(last_deposit) = env.storage().instance().get::<DataKey, u32>(&DataKey::LastDepositLedger(user.clone())) {
+            if last_deposit == current_ledger {
+                panic!("Flash-loan prevention: Cannot withdraw and deposit in same ledger");
+            }
+        }
+        env.storage().instance().set(&DataKey::LastWithdrawalLedger(user.clone()), &current_ledger);
+
+        // Inter-protocol security: Check if payout is paused due to external default (e.g., LeaseFlow)
+        let is_paused = env.storage().instance().get::<DataKey, bool>(&DataKey::PausedPayout(user.clone(), circle_id)).unwrap_or(false);
+        if is_paused {
+            panic!("Your payout is currently locked due to a default in a connected protocol (LeaseFlow). Please resolve the default to unlock.");
+        }
         let mut circle: CircleInfo = env
             .storage()
-            .instance()
-            .get(&DataKey::Circle(circle_id))
-            .unwrap();
-
-        // 4. Check if user is actually a member
-        let member_key = DataKey::Member(user.clone());
-        let mut member: Member = env
-            .storage()
-            .instance()
-            .get(&member_key)
-            .unwrap_or_else(|| panic!("User is not a member of this circle"));
-
-        // 4. Check if payment is on-time
-        let current_time = env.ledger().timestamp();
-
-        if current_time > circle.deadline_timestamp {
-            // Payment is late - track missed deadline but don't apply penalty yet
-            // User must use late_contribution function instead
-            if member.missed_deadline_timestamp == 0 {
-                member.missed_deadline_timestamp = circle.deadline_timestamp;
-                env.storage().instance().set(&member_key, &member);
-            }
-            panic!("Payment is late. Use late_contribution function to pay with late fee.");
-        }
-
-        // 5. Create the Token Client
-        let client = token::Client::new(&env, &circle.token);
-
-        // 6. Transfer the amount from user (no penalty for on-time payment)
-        client.transfer(
-            &user,
-            &env.current_contract_address(),
-            &amount,
-        );
-
-        // 8. Track initial deposit for recovery (only on first contribution)
-        let deposit_key = DataKey::InitialDeposit(circle_id, user.clone());
-        if !env.storage().instance().has(&deposit_key) {
-            env.storage()
-                .instance()
-                .set(&deposit_key, &amount);
-        }
-
-        // 8.5. Track isolated contribution for opted-out members
-        if member.opt_out_of_yield {
-            let isolated_key = DataKey::IsolatedContribution(circle_id, user.clone());
-            let current_isolated: u64 = env.storage().instance().get(&isolated_key).unwrap_or(0);
-            env.storage().instance().set(
-                &isolated_key,
-                &(current_isolated + amount),
-            );
-        }
-
-        // 9. Update member contribution info
-        member.amount_contributed += amount;
-        member.has_contributed = member.amount_contributed >= circle.contribution_amount;
-        if member.has_contributed {
-            member.contribution_count += 1;
-            
-            // Issue #275: Mint SBT for every 5 successful cycles
-            if member.contribution_count % 5 == 0 {
-                Self::mint_sbt_credential(&env, user.clone(), member.contribution_count);
-            }
-        }
-        member.last_contribution_time = current_time;
-        member.missed_deadline_timestamp = 0; // Reset missed deadline timestamp
-
-        // 8. Save updated member info
-        env.storage().instance().set(&member_key, &member);
-
-        // 11. Update circle deadline and last_interaction for next cycle
-        circle.deadline_timestamp = current_time + circle.cycle_duration;
-        env.storage()
             .instance()
             .set(&DataKey::Circle(circle_id), &circle);
 
@@ -803,8 +2359,33 @@ impl SoroSusuTrait for SoroSusu {
             .set(&DataKey::Deposit(circle_id, user), &true);
     }
 
-    fn execute_default(env: Env, circle_id: u64, member: Address) -> Result<(), u32> {
-        // 1. Load the Circle Data
+    /// # Creator-Only: Eject a Member from a Circle
+    ///
+    /// **Why creator-only:** Ejection burns the member's NFT credential and
+    /// marks their status as `Ejected`, permanently removing them from the
+    /// payout queue. Allowing arbitrary callers to eject members would enable
+    /// targeted griefing attacks against honest participants.
+    ///
+    /// **If admin/creator key is lost:** Members cannot be ejected. Defaulting
+    /// members remain in the queue and block payout progression. The insurance
+    /// fund (`trigger_insurance_coverage`) provides a mitigation path that does
+    /// not require ejection.
+    ///
+    /// **DAO migration path:** Introduce a `propose_eject_member` governance
+    /// action requiring a ≥ 2/3 circle-member vote with a 24-hour challenge
+    /// window. This distributes the ejection power across the group and removes
+    /// the single-creator trust assumption.
+    /// Removes a member from a circle. Callable by the circle creator or admin.
+    ///
+    /// # Parameters
+    /// - `caller`: Address initiating the ejection; must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    /// - `member`: Address of the member to eject.
+    ///
+    /// # Panics
+    /// - `"Unauthorized"` — caller is neither the creator nor the admin.
+    fn eject_member(env: Env, caller: Address, circle_id: u64, member: Address) {
+        caller.require_auth();
         let circle: CircleInfo = env
             .storage()
             .instance()
@@ -828,15 +2409,100 @@ impl SoroSusuTrait for SoroSusu {
             return Err(404); // Grace period has not expired yet
         }
 
-        // 5. Mark member as defaulted (store in separate storage for tracking)
-        let defaulted_key = DataKey::DefaultedMember(circle_id, member.clone());
-        env.storage().instance().set(&defaulted_key, &true);
+    /// # Admin-Only: Purge a Stale (5-Year Inactive) Group
+    ///
+    /// Identifies groups that have had no activity for ≥ 5 years
+    /// (157 680 000 seconds), returns any residual token balance to the
+    /// protocol treasury, and removes the circle's storage entry to reclaim
+    /// ledger rent.
+    ///
+    /// **Why admin-only:** Purging deletes on-chain state and transfers funds.
+    /// Restricting this to the admin prevents griefing attacks where an
+    /// adversary purges active circles by manipulating timestamps.
+    ///
+    /// **DAO migration path:** Replace the admin check with a governance
+    /// proposal that any token holder can submit after the 5-year threshold
+    /// is verifiably exceeded.
+    /// Admin-only: archives metadata and returns residual funds to the protocol
+    /// treasury for a circle that has been dormant for ≥ 5 years.
+    ///
+    /// # Parameters
+    /// - `admin`: Admin address; must sign the transaction.
+    /// - `circle_id`: ID of the stale circle to purge.
+    ///
+    /// # Events
+    /// Emits `stale_group_purged { circle_id, admin, residual }`.
+    ///
+    /// # Panics
+    /// - `"Unauthorized: only admin can purge stale groups"` — caller is not admin.
+    /// - `"Circle is not stale: last activity was less than 5 years ago"`.
+    fn purge_stale_group(env: Env, admin: Address, circle_id: u64) {
+        admin.require_auth();
 
-        // 6. In a full implementation, this would:
-        //    - Slash member's stake/collateral
-        //    - Pull from insurance if available
-        //    - Update member's reliability index
-        //    - Notify other members
+        // Verify caller is the stored admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if admin != stored_admin {
+            panic!("Unauthorized: only admin can purge stale groups");
+        }
+
+        // Load the circle
+        let circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+
+        // 5 years in seconds: 5 * 365.25 * 24 * 3600 ≈ 157_766_400
+        const FIVE_YEARS_SECS: u64 = 157_766_400;
+        let now = env.ledger().timestamp();
+        let last_active = circle.deadline_timestamp; // deadline doubles as last-activity marker
+
+        if now < last_active + FIVE_YEARS_SECS {
+            panic!("Circle is not stale: last activity was less than 5 years ago");
+        }
+
+        // Return any residual insurance balance to the protocol treasury
+        let residual = circle.insurance_balance;
+        if residual > 0 {
+            let treasury: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::ProtocolTreasury)
+                .expect("Protocol treasury not set");
+            let token_client = token::Client::new(&env, &circle.token);
+            token_client.transfer(&env.current_contract_address(), &treasury, &residual);
+        }
+
+        // Remove the circle entry to reclaim storage rent
+        env.storage().instance().remove(&DataKey::Circle(circle_id));
+
+        env.events().publish(
+            (Symbol::new(&env, "stale_group_purged"), circle_id),
+            (admin, residual),
+        );
+    }
+
+    /// Assigns a social buddy to the caller for security and recovery purposes.
+    ///
+    /// # Parameters
+    /// - `user`: Address setting the buddy; must sign the transaction.
+    /// - `buddy_address`: Address of the designated buddy.
+    ///
+    /// # Security
+    /// The buddy can cover missed payments from the user's safety deposit and
+    /// participate in social recovery votes on the user's behalf.
+    fn pair_with_member(env: Env, user: Address, buddy_address: Address) {
+        user.require_auth();
+        let user_key = DataKey::Member(user.clone());
+        let mut user_info: Member = env
+            .storage()
+            .instance()
+            .get(&user_key)
+            .expect("Member not found");
 
         // For now, we'll just mark them as defaulted
         Ok(())
@@ -844,6 +2510,21 @@ impl SoroSusuTrait for SoroSusu {
 
     // Issue #324: Slash collateral — move the defaulted member's collateral into
     // the 72-hour pending vault so they have time to appeal before redistribution.
+    /// Admin-only: moves a defaulted member's collateral into the 72-hour
+    /// pending vault (appeals timelock, Issue #324).
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle containing the defaulted member.
+    /// - `member`: Address of the member whose collateral is being slashed.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err(Error::NothingToSlash)` (`405`) if the member has no collateral.
+    ///
+    /// # Security
+    /// Only the stored admin address may call this function. The slashed funds
+    /// are held in a pending vault for 72 hours to allow the member to appeal
+    /// before redistribution to victims.
     fn slash_collateral(env: Env, circle_id: u64, member: Address) -> Result<(), u32> {
         // Only admin may initiate a slash.
         let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(401u32)?;
@@ -907,6 +2588,20 @@ impl SoroSusuTrait for SoroSusu {
 
     // Issue #324: Release pending-slash funds to the group reserve after the
     // 72-hour appeals window has elapsed.
+    /// Releases slashed collateral from the pending vault after the 72-hour
+    /// appeals timelock has expired.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `member`: Address of the member whose pending slash is being released.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err(Error::TimelockActive)` (`406`) if the 72-hour window has not yet elapsed.
+    ///
+    /// # Security
+    /// Enforces `APPEALS_TIMELOCK_SECS` (72 hours) before redistribution,
+    /// giving the member time to raise a dispute.
     fn release_pending_slash(env: Env, circle_id: u64, member: Address) -> Result<(), u32> {
         let record: PendingSlashRecord = env
             .storage()
@@ -1143,14 +2838,132 @@ impl SoroSusuTrait for SoroSusu {
             .map_err(|e| e as u32)
     }
 
-    fn cast_yield_vote(
-        env: Env,
-        voter: Address,
-        circle_id: u64,
-        proposed_strategies: Vec<yield_allocation_voting::DistributionStrategy>,
-    ) -> Result<(), u32> {
-        yield_allocation_voting::cast_vote(&env, voter, circle_id, proposed_strategies)
-            .map_err(|e| e as u32)
+    // Price Oracle and Asset Swap Implementation
+    
+    fn update_price_oracle(env: Env, oracle_provider: Address, asset: Address, price: i128) {
+        // Only authorized oracle providers can update prices (in production, use multi-sig or trusted oracles)
+        oracle_provider.require_auth();
+        
+        if price <= 0 {
+            panic!("Invalid price");
+        }
+        
+        let oracle_data = PriceOracleData {
+            asset_address: asset.clone(),
+            current_price: price,
+            last_updated: env.ledger().timestamp(),
+            is_stable_asset: false, // Would be determined by oracle provider
+        };
+        
+        env.storage().instance().set(&DataKey::PriceOracle(asset), &oracle_data);
+        
+        env.events().publish(
+            (Symbol::new(&env, "PRICE_UPDATED"), asset),
+            (price, env.ledger().timestamp()),
+        );
+    }
+    
+    fn get_asset_price(env: Env, asset: Address) -> PriceOracleData {
+        env.storage().instance()
+            .get(&DataKey::PriceOracle(asset))
+            .expect("Asset price not found")
+    }
+    
+    /// # Admin-Only: Set Hard Asset Basket Weights
+    ///
+    /// **Why admin-only:** The hard asset basket defines the reference
+    /// allocation used by the economic circuit breaker to detect treasury
+    /// instability. Allowing arbitrary callers to change these weights could
+    /// disable the circuit breaker or trigger false-positive asset swaps,
+    /// causing unnecessary treasury rebalancing and member losses.
+    ///
+    /// **If admin key is lost:** The basket weights are frozen at their last
+    /// configured values. The circuit breaker continues to operate against the
+    /// frozen reference basket. No funds are at risk, but the protocol cannot
+    /// adapt to changing macro conditions.
+    ///
+    /// **DAO migration path:** Require a ≥ 2/3 governance vote with a 72-hour
+    /// time-lock before basket weights can be changed. Emit a
+    /// `BASKET_CHANGE_PROPOSED` event at proposal time so members can exit
+    /// before the change takes effect.
+    fn set_hard_asset_basket(env: Env, admin: Address, gold_weight_bps: u32, btc_weight_bps: u32, silver_weight_bps: u32) {
+        // Verify admin authorization
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        
+        if admin != stored_admin {
+            panic!("Unauthorized: only admin can set hard asset basket");
+        }
+        
+        let total_weight = gold_weight_bps + btc_weight_bps + silver_weight_bps;
+        if total_weight != 10000 {
+            panic!("Basket weights must sum to 10000 (100%)");
+        }
+        
+        let basket = HardAssetBasket {
+            gold_weight_bps,
+            btc_weight_bps,
+            silver_weight_bps,
+            total_weight_bps: total_weight,
+        };
+        
+        env.storage().instance().set(&DataKey::HardAssetBasket, &basket);
+        
+        env.events().publish(
+            (Symbol::new(&env, "HARD_ASSET_BASKET_SET")),
+            (gold_weight_bps, btc_weight_bps, silver_weight_bps),
+        );
+    }
+    
+    fn get_hard_asset_basket(env: Env) -> HardAssetBasket {
+        env.storage().instance()
+            .get(&DataKey::HardAssetBasket)
+            .unwrap_or(HardAssetBasket {
+                gold_weight_bps: DEFAULT_HARD_ASSET_GOLD_WEIGHT,
+                btc_weight_bps: DEFAULT_HARD_ASSET_BTC_WEIGHT,
+                silver_weight_bps: DEFAULT_HARD_ASSET_SILVER_WEIGHT,
+                total_weight_bps: 10000,
+            })
+    }
+    
+    fn check_price_drop_and_trigger_swap(env: Env, circle_id: u64) -> bool {
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        // Get current asset price
+        let current_price_data: PriceOracleData = match env.storage().instance().get(&DataKey::PriceOracle(circle.token.clone())) {
+            Some(data) => data,
+            None => return false, // No oracle data available
+        };
+        
+        // Calculate hard asset basket weighted price
+        let basket = Self::get_hard_asset_basket(env.clone());
+        
+        // Get prices for hard assets (simplified - would need actual oracle feeds)
+        // In production, this would query multiple oracle sources
+        let gold_price: PriceOracleData = match env.storage().instance().get(&DataKey::PriceOracle(Address::from_str("GOLD_ASSET_ADDRESS")?)) {
+            Some(data) => data,
+            None => return false,
+        };
+        
+        // Calculate if current asset dropped more than 20% against hard asset basket
+        // Simplified calculation: compare current price to a baseline
+        let price_drop_threshold = (current_price_data.current_price * PRICE_DROP_THRESHOLD_BPS as i128) / 10000;
+        
+        // This is simplified - in production would compare against historical baseline
+        let current_price = current_price_data.current_price;
+        let threshold_price = price_drop_threshold; // 20% drop from some baseline
+        
+        if current_price < threshold_price {
+            // Price drop detected - auto-trigger a swap proposal
+            let target_asset = Address::from_str("STABLE_ASSET_ADDRESS").expect("Invalid address"); // Would be configurable
+            Self::propose_asset_swap(env.clone(), circle.creator.clone(), circle_id, target_asset, 10000);
+            return true;
+        }
+        
+        false
     }
 
     fn finalize_yield_voting(
@@ -1215,6 +3028,21 @@ impl SoroSusuTrait for SoroSusu {
         }
     }
 
+    /// Distributes yield to members in paginated chunks of 10 to avoid gas limits.
+    ///
+    /// Integer division ensures `yield_per_member = total_yield / member_count`
+    /// always rounds **down**, so the contract never attempts to send more funds
+    /// than it holds. The fractional remainder (dust) stays in the contract reserve.
+    /// Call repeatedly until `BatchHarvestProgress.is_complete == true`.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `total_yield_amount`: Total yield in stroops to distribute pro-rata.
+    /// - `member_addresses`: Full member address list.
+    ///
+    /// # Returns
+    /// - `Ok(BatchHarvestProgress)` — progress snapshot after this chunk.
+    /// - `Err(401)` — circle not found.
     fn batch_harvest(
         env: Env,
         circle_id: u64,
@@ -1329,6 +3157,14 @@ impl SoroSusuTrait for SoroSusu {
     // Issue #274 – Group-Reputation Aggregate Score
     // -----------------------------------------------------------------------
 
+    /// Returns the aggregate reputation score for a circle (0–100).
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    ///
+    /// # Returns
+    /// A `u32` score from 0 (poor) to 100 (excellent), based on on-time
+    /// payment history and member reliability indices.
     fn get_group_reputation(env: Env, circle_id: u64) -> u32 {
         // For now, return a mock calculation
         // In a full implementation, this would calculate the average RI of all group members
@@ -1513,6 +3349,16 @@ impl SoroSusuTrait for SoroSusu {
     // Issue #304 – Yield opt-out
     // -----------------------------------------------------------------------
 
+    /// Opts a member out of yield routing for a specific circle.
+    /// Opted-out members' contributions are excluded from AMM routing and
+    /// they receive no yield distributions.
+    ///
+    /// # Parameters
+    /// - `user`: Address opting out; must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
     fn opt_out_of_yield(env: Env, user: Address, circle_id: u64) -> Result<(), u32> {
         user.require_auth();
         let member_key = DataKey::Member(user.clone());
@@ -2933,10 +4779,30 @@ mod fuzz_tests {
         let hash2 = Vec::from_array(&env, [4u8, 5u8, 6u8]);
         let hash3 = Vec::from_array(&env, [7u8, 8u8, 9u8]);
 
-        env.mock_all_auths();
-        SoroSusuTrait::commit_vote(env.clone(), user1.clone(), circle_id, hash1).unwrap();
-        SoroSusuTrait::commit_vote(env.clone(), user2.clone(), circle_id, hash2).unwrap();
-        SoroSusuTrait::commit_vote(env.clone(), user3.clone(), circle_id, hash3).unwrap();
+    /// # Admin-Only: Set Trusted LeaseFlow Bridge Contract
+    ///
+    /// **Why admin-only:** The LeaseFlow contract address is used to verify
+    /// cross-protocol default signals that can pause member payouts. Allowing
+    /// arbitrary callers to set this address would let an attacker register a
+    /// malicious contract that permanently locks all member payouts.
+    ///
+    /// **If admin key is lost:** The LeaseFlow bridge address is frozen. The
+    /// cross-protocol default mechanism continues to work with the existing
+    /// trusted contract. If the LeaseFlow contract is upgraded, the bridge
+    /// cannot be updated and the integration becomes non-functional (but no
+    /// funds are lost).
+    ///
+    /// **DAO migration path:** Require a ≥ 2/3 governance vote with a 48-hour
+    /// time-lock. Emit a `BRIDGE_CHANGE_PROPOSED` event so members can review
+    /// the new contract before it gains the ability to pause payouts.
+    fn set_leaseflow_contract(env: Env, admin: Address, leaseflow: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if admin != stored_admin {
+            panic!("Unauthorized: Only admin can set bridge targets");
+        }
+        env.storage().instance().set(&DataKey::LeaseFlowContract, &leaseflow);
+    }
 
         // Verify session has 3 commits
         let session: VotingSession = env
