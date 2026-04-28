@@ -391,8 +391,8 @@ pub trait SoroSusuTrait {
     // Join an existing circle
     fn join_circle(env: Env, user: Address, circle_id: u64);
 
-    // Make a deposit (Pay your weekly/monthly due)
-    fn deposit(env: Env, user: Address, circle_id: u64, amount: u64);
+    // Make a batch deposit for one or more rounds.
+    fn deposit(env: Env, user: Address, circle_id: u64, rounds: u32);
 
     // Late contribution with fee (pay after deadline but within grace period)
     fn late_contribution(env: Env, user: Address, circle_id: u64);
@@ -1274,8 +1274,8 @@ pub trait SoroSusuTrait {
     // Join an existing circle
     fn join_circle(env: Env, user: Address, circle_id: u64, shares: u32, guarantor: Option<Address>);
 
-    // Make a deposit (Pay your weekly/monthly due)
-    fn deposit(env: Env, user: Address, circle_id: u64);
+    // Make a batch deposit for one or more rounds.
+    fn deposit(env: Env, user: Address, circle_id: u64, rounds: u32);
 
     // NEW: Gas buffer management functions
     fn fund_gas_buffer(env: Env, circle_id: u64, amount: i128);
@@ -2031,7 +2031,7 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
 
-    /// Submits the caller's contribution for the current round.
+    /// Submits the caller's contribution for one or more rounds.
     ///
     /// # Parameters
     /// - `user`: Address making the deposit; must sign the transaction.
@@ -2039,18 +2039,53 @@ impl SoroSusuTrait for SoroSusu {
     ///
     /// # Security
     /// The caller must have pre-approved the SoroSusu contract to transfer
-    /// `circle.contribution_amount` tokens on their behalf (SEP-41 `approve`).
-    /// The token transfer is executed atomically within this call.
+    /// `circle.contribution_amount * rounds` tokens on their behalf
+    /// (SEP-41 `approve`). The token transfer and contribution-history update
+    /// are executed atomically within this call.
     ///
     /// # Panics
     /// - `"Circle not found"` — `circle_id` does not exist.
-    fn deposit(env: Env, user: Address, circle_id: u64) {
+    fn deposit(env: Env, user: Address, circle_id: u64, rounds: u32) {
         user.require_auth();
-        let circle: CircleInfo = env.storage().instance()
+        if rounds == 0 {
+            panic!("Rounds must be greater than zero");
+        }
+
+        let mut circle: CircleInfo = env.storage().instance()
             .get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"));
+
+        let member_key = DataKey::Member(user.clone());
+        let mut member: Member = env.storage().instance()
+            .get(&member_key)
+            .unwrap_or_else(|| panic!("Member not found"));
+
+        if member.status != MemberStatus::Active {
+            panic!("Member not active");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let rounds_i128 = rounds as i128;
+        let total_contribution = circle.contribution_amount
+            .checked_mul(rounds_i128)
+            .unwrap_or_else(|| panic!("Contribution overflow"));
+
         let token_client = soroban_sdk::token::Client::new(&env, &circle.token);
-        token_client.transfer(&user, &env.current_contract_address(), &circle.contribution_amount);
+        token_client.transfer(&user, &env.current_contract_address(), &total_contribution);
+
+        member.contribution_count = member.contribution_count
+            .checked_add(rounds)
+            .unwrap_or_else(|| panic!("Contribution count overflow"));
+        member.last_contribution_time = current_time;
+
+        let contribution_bit = 1u64
+            .checked_shl(member.index)
+            .unwrap_or_else(|| panic!("Member index overflow"));
+        circle.contribution_bitmap |= contribution_bit;
+
+        env.storage().instance().set(&member_key, &member);
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        env.storage().instance().set(&DataKey::Deposit(circle_id, user), &true);
     }
 
 

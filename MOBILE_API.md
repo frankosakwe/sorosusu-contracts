@@ -136,23 +136,25 @@ xdr.ScVal.scvVoid()
 
 ### `deposit`
 
-Submits the user's contribution for the current round.
+Submits the user's contribution for one or more rounds in a single ledger transaction.
 
 ```
 Function : deposit
 Arguments:
   [0] user      : Address
   [1] circle_id : u64
+  [2] rounds    : u32
 Returns  : void
 Auth     : user must sign
-Notes    : The token transfer is executed internally. The user must have
-           approved the contract to spend `amount` tokens beforehand.
+Notes    : The token transfer and member contribution-history update are
+           executed atomically. The user must have approved the contract to
+           spend `amount * rounds` tokens beforehand.
 ```
 
 **Pre-approval (SEP-41 `approve`):**
 
 ```js
-// Approve the SoroSusu contract to pull `amount` from the user's balance.
+// Approve the SoroSusu contract to pull `amount * rounds` from the user's balance.
 const approveOp = tokenContract.call(
   "approve",
   nativeToScVal(userAddress, { type: "address" }),
