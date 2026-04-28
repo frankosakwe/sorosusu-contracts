@@ -984,7 +984,7 @@ fn apply_recovery_if_consensus(env: &Env, actor: &Address, circle_id: u64, circl
     }
 
     let votes = circle.recovery_votes_bitmap.count_ones();
-    if votes * 100 <= active_members * 70 {
+    if votes * 100 <= active_members * 66 {
         return;
     }
 
@@ -997,7 +997,7 @@ fn apply_recovery_if_consensus(env: &Env, actor: &Address, circle_id: u64, circl
         .clone()
         .unwrap_or_else(|| panic!("No recovery proposal"));
 
-    let old_member_key = DataKey::Member(old_address);
+        let old_member_key = DataKey::Member(old_address.clone());
     let mut old_member: Member = env
         .storage()
         .instance()
@@ -1016,6 +1016,26 @@ fn apply_recovery_if_consensus(env: &Env, actor: &Address, circle_id: u64, circl
     old_member.address = new_address.clone();
     env.storage().instance().set(&new_member_key, &old_member);
     env.storage().instance().remove(&old_member_key);
+
+        // Migrate UserStats
+        if let Some(stats) = env.storage().instance().get::<DataKey, UserStats>(&DataKey::UserStats(old_address.clone())) {
+            env.storage().instance().set(&DataKey::UserStats(new_address.clone()), &stats);
+            env.storage().instance().remove(&DataKey::UserStats(old_address.clone()));
+        }
+
+        // Migrate SocialCapital
+        if let Some(sc) = env.storage().instance().get::<DataKey, SocialCapital>(&DataKey::SocialCapital(old_address.clone(), circle_id)) {
+            let mut new_sc = sc.clone();
+            new_sc.member = new_address.clone();
+            env.storage().instance().set(&DataKey::SocialCapital(new_address.clone(), circle_id), &new_sc);
+            env.storage().instance().remove(&DataKey::SocialCapital(old_address.clone(), circle_id));
+        }
+
+        // Migrate SafetyDeposit
+        if let Some(sd) = env.storage().instance().get::<DataKey, i128>(&DataKey::SafetyDeposit(old_address.clone(), circle_id)) {
+            env.storage().instance().set(&DataKey::SafetyDeposit(new_address.clone(), circle_id), &sd);
+            env.storage().instance().remove(&DataKey::SafetyDeposit(old_address.clone(), circle_id));
+        }
 
     circle
         .member_addresses
@@ -1467,7 +1487,7 @@ impl SoroSusuTrait for SoroSusu {
 
         // Emit event
         env.events().publish(
-            (Symbol::new(&env, "round_finalized"), circle_id),
+            (Symbol::new(&env, "Payout_Ready"), circle_id),
             (next_recipient, scheduled_time),
         );
     }
@@ -2867,6 +2887,78 @@ impl SoroSusuTrait for SoroSusu {
             &user,
             &(amount as i128),
         );
+    }
+
+    fn execute_default(env: Env, circle_id: u64, member: Address) -> Result<(), u32> {
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let defaulted_key = DataKey::DefaultedMember(circle_id, member.clone());
+        env.storage().instance().set(&defaulted_key, &true);
+        
+        env.events().publish(
+            (Symbol::new(&env, "Member_Default"), circle_id),
+            (member, circle.deadline_timestamp),
+        );
+        Ok(())
+    }
+
+    fn social_recovery_request(
+        env: Env,
+        user: Address,
+        circle_id: u64,
+        old_address: Address,
+        new_address: Address,
+    ) {
+        user.require_auth();
+        let mut circle = Self::get_circle(env.clone(), circle_id);
+        
+        let old_member_key = DataKey::Member(old_address.clone());
+        let _old_member: Member = env.storage().instance().get(&old_member_key)
+            .unwrap_or_else(|| panic!("Old address is not a member"));
+
+        circle.recovery_old_address = Some(old_address);
+        circle.recovery_new_address = Some(new_address);
+        circle.recovery_votes_bitmap = 0;
+        
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn send_contribution_reminder(env: Env, circle_id: u64, member: Address) {
+        let circle = Self::get_circle(env.clone(), circle_id);
+        env.events().publish(
+            (Symbol::new(&env, "Contribution_Reminder"), circle_id),
+            (member, circle.deadline_timestamp),
+        );
+    }
+
+    fn set_invite_hash(env: Env, admin: Address, circle_id: u64, invite_hash: soroban_sdk::BytesN<32>) {
+        admin.require_auth();
+        let circle = Self::get_circle(env.clone(), circle_id);
+        if circle.creator != admin {
+            panic!("Only creator can set invite hash");
+        }
+        env.storage().instance().set(&DataKey::InviteHash(circle_id), &invite_hash);
+    }
+
+    fn join_circle_with_invite(env: Env, user: Address, circle_id: u64, shares: u32, guarantor: Option<Address>, salt: soroban_sdk::BytesN<32>) {
+        let expected_hash: soroban_sdk::BytesN<32> = env.storage().instance().get(&DataKey::InviteHash(circle_id))
+            .unwrap_or_else(|| panic!("No invite hash set for this circle"));
+        
+        let mut payload = soroban_sdk::Bytes::new(&env);
+        payload.extend_from_array(&circle_id.to_be_bytes());
+        payload.extend_from_array(&salt.to_array());
+        let actual_hash = env.crypto().sha256(&payload);
+        
+        if actual_hash != expected_hash {
+            panic!("Invalid invite salt");
+        }
+        
+        Self::join_circle(env.clone(), user, circle_id, shares, guarantor);
+    }
+
+    fn relayed_deposit(env: Env, relayer: Address, user: Address, circle_id: u64) {
+        relayer.require_auth();
+        user.require_auth(); // Uses Soroban's native auth for offline SEP-27 XDR signature verification
+        Self::deposit(env, user, circle_id);
     }
 
     // -----------------------------------------------------------------------
