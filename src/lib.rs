@@ -73,15 +73,15 @@ pub enum DataKey {
     MissingTrustline(u64, Address), // CircleID, MemberAddress
 }
 
-/// Issue #324: Record stored in the PendingSlash vault.
-#[contracttype]
-#[derive(Clone)]
-pub struct PendingSlashRecord {
-    /// Amount of collateral held in the vault (in token stroops).
-    pub amount: u64,
-    /// Ledger timestamp at which the slash was recorded.
-    pub slashed_at: u64,
-}
+pub use liquidity_buffer::*;
+mod sbt_minter;
+pub use sbt_minter::*;
+mod lending_market;
+mod reputation_export;
+pub use reputation_export::*;
+
+#[cfg(test)]
+mod reputation_export_tests;
 
 /// 72 hours in seconds — the mandatory appeals window before slashed collateral
 /// can be redistributed to victims (Issue #324).
@@ -218,6 +218,13 @@ pub enum DataKey {
     EmergencyLoan(u64),                 // Emergency loan requests
     RepaymentSchedule(u64),            // Loan repayment schedules
     LendingMarketStats,               // Lending market statistics
+    // Issue #375: ZK-Privacy Blind-Matching Pool Logic
+    ZkShieldedPool,                   // Shielded pool state
+    ZkCommitment(BytesN<32>),         // Commitment by nullifier
+    ZkSpentNullifier(BytesN<32>),    // Spent nullifiers (double-spend prevention)
+    ZkSocialSlash(u64),              // Social slash records
+    ZkSocialSlashCount,              // Social slash counter
+    ZkNullifierCircle(BytesN<32>),   // Nullifier to circle mapping (encrypted)
 }
 
 // --- SEP-24 ANCHOR INTEGRATION DATA STRUCTURES ---
@@ -740,6 +747,59 @@ pub trait SoroSusuTrait {
         user: Address,
         method: passkey_auth::AuthMethod,
     ) -> Result<(), u32>;
+
+    // --- Issue #376: Adaptive Quorum for Global Protocol Governance ---
+
+    /// Initialize adaptive quorum settings (admin only)
+    fn initialize_adaptive_quorum_settings(env: Env, admin: Address);
+
+    /// Create a proposal with adaptive quorum
+    fn create_adaptive_proposal(
+        env: Env,
+        caller: Address,
+        circle_id: u64,
+        proposal_type: u32, // 0 = Emergency, 1 = Standard
+        voting_duration_seconds: u64,
+    ) -> u64;
+
+    /// Cast a vote on an adaptive quorum proposal
+    fn cast_adaptive_vote(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        vote_choice: bool, // true = For, false = Against
+    );
+
+    /// Contest a proposal (resets decay timer if threshold reached)
+    fn contest_proposal(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+    ) -> bool;
+
+    /// Execute an adaptive quorum proposal
+    fn execute_adaptive_proposal(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<bool, u32>;
+
+    /// Get current adaptive quorum state for a proposal
+    fn get_adaptive_quorum_state(
+        env: Env,
+        proposal_id: u64,
+    ) -> Option<adaptive_quorum::AdaptiveQuorumState>;
+
+    /// Get current calculated quorum for a proposal
+    fn get_current_quorum(
+        env: Env,
+        proposal_id: u64,
+    ) -> u32;
+
+    /// Get participation velocity data
+    fn get_participation_velocity(
+        env: Env,
+    ) -> Option<adaptive_quorum::ParticipationVelocity>;
 }
 
 // --- IMPLEMENTATION ---
@@ -1092,6 +1152,30 @@ pub struct DepositMemo {
     pub compliance_data: String, // Encrypted compliance information
 }
 
+/// User Statistics - Tracks user reputation metrics across all circles
+#[contracttype]
+#[derive(Clone)]
+pub struct UserStats {
+    pub total_volume_saved: i128,
+    pub on_time_contributions: u32,
+    pub late_contributions: u32,
+}
+
+/// Reputation Data - Full reputation profile for a user
+#[contracttype]
+#[derive(Clone)]
+pub struct ReputationData {
+    pub user_address: Address,
+    pub susu_score: u32,        // RI (0-10000 bps)
+    pub reliability_score: u32, // 0-10000 bps
+    pub total_contributions: u32,
+    pub on_time_rate: u32,      // 0-10000 bps
+    pub volume_saved: i128,
+    pub social_capital: u32,    // 0-10000 bps
+    pub last_updated: u64,
+    pub is_active: bool,
+}
+
 
 // --- CONTRACT CLIENTS ---
 
@@ -1312,6 +1396,37 @@ pub trait SoroSusuTrait {
     // Inter-contract reputation query interface
     fn get_reputation(env: Env, user: Address) -> ReputationData;
 
+    // --- Issue #374: Multi-Chain Reputation Export ---
+
+    /// Initialize Wormhole bridge configuration for cross-chain reputation exports
+    fn init_wormhole_config(env: Env, admin: Address, wormhole_contract: Address, supported_chains: Vec<u16>);
+
+    /// Export user's reputation to a destination chain via Wormhole
+    /// Returns (export_id, payload_hash) on success
+    fn export_reputation(
+        env: Env,
+        user: Address,
+        destination_chain: u16,
+        fee_paid: i128,
+        ri_score: u32,
+        total_cycles: u32,
+        defaults_count: u32,
+        on_time_rate_bps: u32,
+        volume_saved: i128,
+    ) -> Result<(u64, BytesN<32>), u32>;
+
+    /// Get export metadata by export ID
+    fn get_export_metadata(env: Env, export_id: u64) -> Option<ExportMetadata>;
+
+    /// Get user's export nonce
+    fn get_export_nonce(env: Env, user: Address) -> u64;
+
+    /// Check if a user can export (no pending investigations, cooldown met)
+    fn can_export(env: Env, user: Address) -> bool;
+
+    /// Get the Wormhole configuration
+    fn get_wormhole_config(env: Env) -> Option<WormholeConfig>;
+
     // Multi-Asset Reserve Currency Basket
     fn create_basket_circle(
         env: Env,
@@ -1342,6 +1457,33 @@ pub trait SoroSusuTrait {
     // Grant-Stream Matching Logic
     fn handle_grant_stream_match(env: Env, grant_stream_contract: Address, circle_id: u64, amount: i128);
     fn set_grant_stream_contract(env: Env, admin: Address, grant_stream: Address);
+
+    // Issue #375: ZK-Privacy Blind-Matching Pool Logic
+    fn init_shielded_pool(env: Env);
+    fn shielded_deposit(
+        env: Env,
+        user: Address,
+        amount: i128,
+        circle_id: u64,
+        commitment: BytesN<32>,
+        nullifier: BytesN<32>,
+    ) -> Result<BytesN<32>, u32>;
+    fn verify_blind_contribution(
+        env: Env,
+        user: Address,
+        circle_id: u64,
+        proof: zk_privacy::ZkProof,
+        nullifier: BytesN<32>,
+    ) -> Result<(), u32>;
+    fn social_slash_void_proof(
+        env: Env,
+        admin: Address,
+        circle_id: u64,
+        nullifier: BytesN<32>,
+        reason: Symbol,
+    ) -> Result<(), u32>;
+    fn get_shielded_balance(env: Env) -> i128;
+    fn is_nullifier_spent(env: Env, nullifier: BytesN<32>) -> bool;
 }
 
 // --- IMPLEMENTATION ---
@@ -3991,6 +4133,227 @@ impl SoroSusuTrait for SoroSusu {
         // For now, return empty vector
         Vec::new(env)
     }
+
+    // --- Issue #376: Adaptive Quorum for Global Protocol Governance ---
+
+    fn initialize_adaptive_quorum_settings(env: Env, admin: Address) {
+        // Verify admin authorization
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        
+        if admin != stored_admin {
+            panic!("Unauthorized: Only admin can initialize adaptive quorum settings");
+        }
+
+        let settings = adaptive_quorum::initialize_adaptive_quorum_settings(&env);
+        env.storage().instance().set(&DataKey::AdaptiveQuorumSettings, &settings);
+        
+        // Initialize empty participation velocity tracking
+        let velocity = adaptive_quorum::ParticipationVelocity {
+            vote_records: Vec::new(&env),
+            average_participation: 0,
+            velocity_trend: 0,
+        };
+        env.storage().instance().set(&DataKey::ParticipationVelocity, &velocity);
+    }
+
+    fn create_adaptive_proposal(
+        env: Env,
+        caller: Address,
+        circle_id: u64,
+        proposal_type: u32,
+        voting_duration_seconds: u64,
+    ) -> u64 {
+        // Get or initialize settings
+        let settings: adaptive_quorum::AdaptiveQuorumSettings = env.storage().instance()
+            .get(&DataKey::AdaptiveQuorumSettings)
+            .unwrap_or_else(|| adaptive_quorum::initialize_adaptive_quorum_settings(&env));
+
+        // Get circle to determine eligible voters
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+
+        let proposal_type_enum = match proposal_type {
+            0 => adaptive_quorum::ProposalType::Emergency,
+            1 => adaptive_quorum::ProposalType::Standard,
+            _ => panic!("Invalid proposal type"),
+        };
+
+        // Generate proposal ID
+        let proposal_count: u64 = env.storage().instance()
+            .get(&DataKey::CircleCount)
+            .unwrap_or(0);
+        let proposal_id = proposal_count + 1;
+
+        // Create adaptive quorum state
+        let state = adaptive_quorum::create_adaptive_quorum_state(
+            &env,
+            proposal_id,
+            circle_id,
+            proposal_type_enum,
+            circle.member_count,
+            voting_duration_seconds,
+            &settings,
+        );
+
+        // Store the state
+        env.storage().instance().set(&DataKey::AdaptiveQuorumState(proposal_id), &state);
+
+        proposal_id
+    }
+
+    fn cast_adaptive_vote(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        vote_choice: bool,
+    ) {
+        let state_key = DataKey::AdaptiveQuorumState(proposal_id);
+        let mut state: adaptive_quorum::AdaptiveQuorumState = env.storage().instance()
+            .get(&state_key)
+            .expect("Proposal not found");
+
+        let current_timestamp = env.ledger().timestamp();
+
+        // Check if proposal has expired
+        if adaptive_quorum::is_proposal_expired(&state, current_timestamp) {
+            panic!("Proposal has expired");
+        }
+
+        // Increment participant count
+        state.current_participants += 1;
+
+        // Check if decay should be triggered for emergency proposals
+        if state.config.proposal_type == adaptive_quorum::ProposalType::Emergency {
+            let old_quorum = state.config.current_quorum_bps;
+            let new_quorum = adaptive_quorum::calculate_adaptive_quorum(&env, &state, current_timestamp);
+            
+            if new_quorum != old_quorum {
+                state.config.current_quorum_bps = new_quorum;
+                adaptive_quorum::emit_quorum_decay_triggered(
+                    &env,
+                    proposal_id,
+                    old_quorum,
+                    new_quorum,
+                    current_timestamp,
+                );
+            }
+        }
+
+        // Update state
+        env.storage().instance().set(&state_key, &state);
+    }
+
+    fn contest_proposal(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+    ) -> bool {
+        let state_key = DataKey::AdaptiveQuorumState(proposal_id);
+        let mut state: adaptive_quorum::AdaptiveQuorumState = env.storage().instance()
+            .get(&state_key)
+            .expect("Proposal not found");
+
+        let current_timestamp = env.ledger().timestamp();
+
+        // Check if proposal has expired
+        if adaptive_quorum::is_proposal_expired(&state, current_timestamp) {
+            panic!("Proposal has expired");
+        }
+
+        // Register the contest
+        let reset_triggered = adaptive_quorum::register_contest_vote(
+            &env,
+            &mut state,
+            &voter,
+            current_timestamp,
+        );
+
+        // Update state
+        env.storage().instance().set(&state_key, &state);
+
+        reset_triggered
+    }
+
+    fn execute_adaptive_proposal(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<bool, u32> {
+        let state_key = DataKey::AdaptiveQuorumState(proposal_id);
+        let state: adaptive_quorum::AdaptiveQuorumState = env.storage().instance()
+            .get(&state_key)
+            .ok_or(401)?; // Proposal not found
+
+        let current_timestamp = env.ledger().timestamp();
+
+        // Check if proposal has expired
+        if adaptive_quorum::is_proposal_expired(&state, current_timestamp) {
+            return Err(402); // Proposal expired
+        }
+
+        // Check if quorum is met
+        let quorum_met = adaptive_quorum::is_quorum_met(&env, &state, current_timestamp);
+        
+        if !quorum_met {
+            return Err(403); // Quorum not met
+        }
+
+        // Record participation for velocity tracking
+        let participation_record = adaptive_quorum::record_participation(
+            &env,
+            proposal_id,
+            state.total_eligible_voters,
+            state.current_participants,
+            current_timestamp,
+        );
+
+        let velocity_key = DataKey::ParticipationVelocity;
+        let mut velocity: adaptive_quorum::ParticipationVelocity = env.storage().instance()
+            .get(&velocity_key)
+            .unwrap_or_else(|| adaptive_quorum::ParticipationVelocity {
+                vote_records: Vec::new(&env),
+                average_participation: 0,
+                velocity_trend: 0,
+            });
+
+        adaptive_quorum::update_velocity_tracking(&env, &mut velocity, participation_record);
+        env.storage().instance().set(&velocity_key, &velocity);
+
+        // Mark proposal as executed
+        let mut updated_state = state.clone();
+        updated_state.config.is_decayed = true;
+        env.storage().instance().set(&state_key, &updated_state);
+
+        Ok(true)
+    }
+
+    fn get_adaptive_quorum_state(
+        env: Env,
+        proposal_id: u64,
+    ) -> Option<adaptive_quorum::AdaptiveQuorumState> {
+        env.storage().instance().get(&DataKey::AdaptiveQuorumState(proposal_id))
+    }
+
+    fn get_current_quorum(
+        env: Env,
+        proposal_id: u64,
+    ) -> u32 {
+        let state: adaptive_quorum::AdaptiveQuorumState = env.storage().instance()
+            .get(&DataKey::AdaptiveQuorumState(proposal_id))
+            .expect("Proposal not found");
+
+        let current_timestamp = env.ledger().timestamp();
+        adaptive_quorum::calculate_adaptive_quorum(&env, &state, current_timestamp)
+    }
+
+    fn get_participation_velocity(
+        env: Env,
+    ) -> Option<adaptive_quorum::ParticipationVelocity> {
+        env.storage().instance().get(&DataKey::ParticipationVelocity)
+    }
 }
 
 // --- HELPER FUNCTIONS ---
@@ -4935,6 +5298,54 @@ mod fuzz_tests {
             panic!("Unauthorized: Only admin can set bridge targets");
         }
         env.storage().instance().set(&DataKey::LeaseFlowContract, &leaseflow);
+    }
+
+    // --- Issue #375: ZK-Privacy Blind-Matching Pool Logic ---
+
+    fn init_shielded_pool(env: Env) {
+        zk_privacy::ZkVerifierTrait::init_shielded_pool(env);
+    }
+
+    fn shielded_deposit(
+        env: Env,
+        user: Address,
+        amount: i128,
+        circle_id: u64,
+        commitment: BytesN<32>,
+        nullifier: BytesN<32>,
+    ) -> Result<BytesN<32>, u32> {
+        zk_privacy::ZkVerifierTrait::shielded_deposit(env, user, amount, circle_id, commitment, nullifier)
+            .map_err(|e| e as u32)
+    }
+
+    fn verify_blind_contribution(
+        env: Env,
+        user: Address,
+        circle_id: u64,
+        proof: zk_privacy::ZkProof,
+        nullifier: BytesN<32>,
+    ) -> Result<(), u32> {
+        zk_privacy::ZkVerifierTrait::verify_blind_contribution(env, user, circle_id, proof, nullifier)
+            .map_err(|e| e as u32)
+    }
+
+    fn social_slash_void_proof(
+        env: Env,
+        admin: Address,
+        circle_id: u64,
+        nullifier: BytesN<32>,
+        reason: Symbol,
+    ) -> Result<(), u32> {
+        zk_privacy::ZkVerifierTrait::social_slash_void_proof(env, admin, circle_id, nullifier, reason)
+            .map_err(|e| e as u32)
+    }
+
+    fn get_shielded_balance(env: Env) -> i128 {
+        zk_privacy::ZkVerifierTrait::get_shielded_balance(env)
+    }
+
+    fn is_nullifier_spent(env: Env, nullifier: BytesN<32>) -> bool {
+        zk_privacy::ZkVerifierTrait::is_nullifier_spent(env, nullifier)
     }
 
         // Verify session has 3 commits
