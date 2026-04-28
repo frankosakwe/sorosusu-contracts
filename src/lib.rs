@@ -13,6 +13,8 @@ pub mod yield_strategy_trait;
 pub mod juror_selection;
 // Stellar Protocol 21+ Passkey Authentication Support
 pub mod passkey_auth;
+// Issue #380: Hierarchical Susu-Aggregation for Institutional Lending
+pub mod aggregate_credit;
 
 // Issue #321: Maximum cycle duration cap (2 years in seconds) to prevent
 // integer overflow exploits and unbounded storage accumulation.
@@ -66,15 +68,15 @@ pub enum DataKey {
     MissingTrustline(u64, Address), // CircleID, MemberAddress
 }
 
-/// Issue #324: Record stored in the PendingSlash vault.
-#[contracttype]
-#[derive(Clone)]
-pub struct PendingSlashRecord {
-    /// Amount of collateral held in the vault (in token stroops).
-    pub amount: u64,
-    /// Ledger timestamp at which the slash was recorded.
-    pub slashed_at: u64,
-}
+pub use liquidity_buffer::*;
+mod sbt_minter;
+pub use sbt_minter::*;
+mod lending_market;
+mod reputation_export;
+pub use reputation_export::*;
+
+#[cfg(test)]
+mod reputation_export_tests;
 
 /// 72 hours in seconds — the mandatory appeals window before slashed collateral
 /// can be redistributed to victims (Issue #324).
@@ -222,6 +224,13 @@ pub enum DataKey {
     EmergencyLoan(u64),                 // Emergency loan requests
     RepaymentSchedule(u64),            // Loan repayment schedules
     LendingMarketStats,               // Lending market statistics
+    // Issue #375: ZK-Privacy Blind-Matching Pool Logic
+    ZkShieldedPool,                   // Shielded pool state
+    ZkCommitment(BytesN<32>),         // Commitment by nullifier
+    ZkSpentNullifier(BytesN<32>),    // Spent nullifiers (double-spend prevention)
+    ZkSocialSlash(u64),              // Social slash records
+    ZkSocialSlashCount,              // Social slash counter
+    ZkNullifierCircle(BytesN<32>),   // Nullifier to circle mapping (encrypted)
 }
 
 // --- SEP-24 ANCHOR INTEGRATION DATA STRUCTURES ---
@@ -1248,6 +1257,30 @@ pub struct DepositMemo {
     pub compliance_data: String, // Encrypted compliance information
 }
 
+/// User Statistics - Tracks user reputation metrics across all circles
+#[contracttype]
+#[derive(Clone)]
+pub struct UserStats {
+    pub total_volume_saved: i128,
+    pub on_time_contributions: u32,
+    pub late_contributions: u32,
+}
+
+/// Reputation Data - Full reputation profile for a user
+#[contracttype]
+#[derive(Clone)]
+pub struct ReputationData {
+    pub user_address: Address,
+    pub susu_score: u32,        // RI (0-10000 bps)
+    pub reliability_score: u32, // 0-10000 bps
+    pub total_contributions: u32,
+    pub on_time_rate: u32,      // 0-10000 bps
+    pub volume_saved: i128,
+    pub social_capital: u32,    // 0-10000 bps
+    pub last_updated: u64,
+    pub is_active: bool,
+}
+
 
 // --- CONTRACT CLIENTS ---
 
@@ -1468,6 +1501,37 @@ pub trait SoroSusuTrait {
     // Inter-contract reputation query interface
     fn get_reputation(env: Env, user: Address) -> ReputationData;
 
+    // --- Issue #374: Multi-Chain Reputation Export ---
+
+    /// Initialize Wormhole bridge configuration for cross-chain reputation exports
+    fn init_wormhole_config(env: Env, admin: Address, wormhole_contract: Address, supported_chains: Vec<u16>);
+
+    /// Export user's reputation to a destination chain via Wormhole
+    /// Returns (export_id, payload_hash) on success
+    fn export_reputation(
+        env: Env,
+        user: Address,
+        destination_chain: u16,
+        fee_paid: i128,
+        ri_score: u32,
+        total_cycles: u32,
+        defaults_count: u32,
+        on_time_rate_bps: u32,
+        volume_saved: i128,
+    ) -> Result<(u64, BytesN<32>), u32>;
+
+    /// Get export metadata by export ID
+    fn get_export_metadata(env: Env, export_id: u64) -> Option<ExportMetadata>;
+
+    /// Get user's export nonce
+    fn get_export_nonce(env: Env, user: Address) -> u64;
+
+    /// Check if a user can export (no pending investigations, cooldown met)
+    fn can_export(env: Env, user: Address) -> bool;
+
+    /// Get the Wormhole configuration
+    fn get_wormhole_config(env: Env) -> Option<WormholeConfig>;
+
     // Multi-Asset Reserve Currency Basket
     fn create_basket_circle(
         env: Env,
@@ -1498,6 +1562,33 @@ pub trait SoroSusuTrait {
     // Grant-Stream Matching Logic
     fn handle_grant_stream_match(env: Env, grant_stream_contract: Address, circle_id: u64, amount: i128);
     fn set_grant_stream_contract(env: Env, admin: Address, grant_stream: Address);
+
+    // Issue #375: ZK-Privacy Blind-Matching Pool Logic
+    fn init_shielded_pool(env: Env);
+    fn shielded_deposit(
+        env: Env,
+        user: Address,
+        amount: i128,
+        circle_id: u64,
+        commitment: BytesN<32>,
+        nullifier: BytesN<32>,
+    ) -> Result<BytesN<32>, u32>;
+    fn verify_blind_contribution(
+        env: Env,
+        user: Address,
+        circle_id: u64,
+        proof: zk_privacy::ZkProof,
+        nullifier: BytesN<32>,
+    ) -> Result<(), u32>;
+    fn social_slash_void_proof(
+        env: Env,
+        admin: Address,
+        circle_id: u64,
+        nullifier: BytesN<32>,
+        reason: Symbol,
+    ) -> Result<(), u32>;
+    fn get_shielded_balance(env: Env) -> i128;
+    fn is_nullifier_spent(env: Env, nullifier: BytesN<32>) -> bool;
 }
 
 // --- IMPLEMENTATION ---
@@ -5465,6 +5556,54 @@ mod fuzz_tests {
             panic!("Unauthorized: Only admin can set bridge targets");
         }
         env.storage().instance().set(&DataKey::LeaseFlowContract, &leaseflow);
+    }
+
+    // --- Issue #375: ZK-Privacy Blind-Matching Pool Logic ---
+
+    fn init_shielded_pool(env: Env) {
+        zk_privacy::ZkVerifierTrait::init_shielded_pool(env);
+    }
+
+    fn shielded_deposit(
+        env: Env,
+        user: Address,
+        amount: i128,
+        circle_id: u64,
+        commitment: BytesN<32>,
+        nullifier: BytesN<32>,
+    ) -> Result<BytesN<32>, u32> {
+        zk_privacy::ZkVerifierTrait::shielded_deposit(env, user, amount, circle_id, commitment, nullifier)
+            .map_err(|e| e as u32)
+    }
+
+    fn verify_blind_contribution(
+        env: Env,
+        user: Address,
+        circle_id: u64,
+        proof: zk_privacy::ZkProof,
+        nullifier: BytesN<32>,
+    ) -> Result<(), u32> {
+        zk_privacy::ZkVerifierTrait::verify_blind_contribution(env, user, circle_id, proof, nullifier)
+            .map_err(|e| e as u32)
+    }
+
+    fn social_slash_void_proof(
+        env: Env,
+        admin: Address,
+        circle_id: u64,
+        nullifier: BytesN<32>,
+        reason: Symbol,
+    ) -> Result<(), u32> {
+        zk_privacy::ZkVerifierTrait::social_slash_void_proof(env, admin, circle_id, nullifier, reason)
+            .map_err(|e| e as u32)
+    }
+
+    fn get_shielded_balance(env: Env) -> i128 {
+        zk_privacy::ZkVerifierTrait::get_shielded_balance(env)
+    }
+
+    fn is_nullifier_spent(env: Env, nullifier: BytesN<32>) -> bool {
+        zk_privacy::ZkVerifierTrait::is_nullifier_spent(env, nullifier)
     }
 
         // Verify session has 3 commits
