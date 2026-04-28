@@ -13,10 +13,13 @@ pub mod yield_strategy_trait;
 pub mod juror_selection;
 // Stellar Protocol 21+ Passkey Authentication Support
 pub mod passkey_auth;
-// Issue #375: ZK-Privacy Blind-Matching Pool Logic
-pub mod zk_privacy;
+// Issue #377: Dynamic "Susu-to-DeFi" Yield Bridge Adapter
+pub mod defi_adapter_trait;
+pub mod yield_bridge_adapter;
 #[cfg(test)]
-pub mod zk_privacy_tests;
+mod yield_bridge_adapter_tests;
+#[cfg(test)]
+mod yield_bridge_integration_tests;
 
 // Issue #321: Maximum cycle duration cap (2 years in seconds) to prevent
 // integer overflow exploits and unbounded storage accumulation.
