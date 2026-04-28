@@ -70,15 +70,15 @@ pub enum DataKey {
     MissingTrustline(u64, Address), // CircleID, MemberAddress
 }
 
-/// Issue #324: Record stored in the PendingSlash vault.
-#[contracttype]
-#[derive(Clone)]
-pub struct PendingSlashRecord {
-    /// Amount of collateral held in the vault (in token stroops).
-    pub amount: u64,
-    /// Ledger timestamp at which the slash was recorded.
-    pub slashed_at: u64,
-}
+pub use liquidity_buffer::*;
+mod sbt_minter;
+pub use sbt_minter::*;
+mod lending_market;
+mod reputation_export;
+pub use reputation_export::*;
+
+#[cfg(test)]
+mod reputation_export_tests;
 
 /// 72 hours in seconds — the mandatory appeals window before slashed collateral
 /// can be redistributed to victims (Issue #324).
@@ -1149,6 +1149,30 @@ pub struct DepositMemo {
     pub compliance_data: String, // Encrypted compliance information
 }
 
+/// User Statistics - Tracks user reputation metrics across all circles
+#[contracttype]
+#[derive(Clone)]
+pub struct UserStats {
+    pub total_volume_saved: i128,
+    pub on_time_contributions: u32,
+    pub late_contributions: u32,
+}
+
+/// Reputation Data - Full reputation profile for a user
+#[contracttype]
+#[derive(Clone)]
+pub struct ReputationData {
+    pub user_address: Address,
+    pub susu_score: u32,        // RI (0-10000 bps)
+    pub reliability_score: u32, // 0-10000 bps
+    pub total_contributions: u32,
+    pub on_time_rate: u32,      // 0-10000 bps
+    pub volume_saved: i128,
+    pub social_capital: u32,    // 0-10000 bps
+    pub last_updated: u64,
+    pub is_active: bool,
+}
+
 
 // --- CONTRACT CLIENTS ---
 
@@ -1368,6 +1392,37 @@ pub trait SoroSusuTrait {
 
     // Inter-contract reputation query interface
     fn get_reputation(env: Env, user: Address) -> ReputationData;
+
+    // --- Issue #374: Multi-Chain Reputation Export ---
+
+    /// Initialize Wormhole bridge configuration for cross-chain reputation exports
+    fn init_wormhole_config(env: Env, admin: Address, wormhole_contract: Address, supported_chains: Vec<u16>);
+
+    /// Export user's reputation to a destination chain via Wormhole
+    /// Returns (export_id, payload_hash) on success
+    fn export_reputation(
+        env: Env,
+        user: Address,
+        destination_chain: u16,
+        fee_paid: i128,
+        ri_score: u32,
+        total_cycles: u32,
+        defaults_count: u32,
+        on_time_rate_bps: u32,
+        volume_saved: i128,
+    ) -> Result<(u64, BytesN<32>), u32>;
+
+    /// Get export metadata by export ID
+    fn get_export_metadata(env: Env, export_id: u64) -> Option<ExportMetadata>;
+
+    /// Get user's export nonce
+    fn get_export_nonce(env: Env, user: Address) -> u64;
+
+    /// Check if a user can export (no pending investigations, cooldown met)
+    fn can_export(env: Env, user: Address) -> bool;
+
+    /// Get the Wormhole configuration
+    fn get_wormhole_config(env: Env) -> Option<WormholeConfig>;
 
     // Multi-Asset Reserve Currency Basket
     fn create_basket_circle(
