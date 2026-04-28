@@ -19,6 +19,7 @@ This document is the primary reference for developers building a SoroSusu-compat
    - [late_contribution](#late_contribution)
    - [get_circle](#get_circle)
    - [get_member](#get_member)
+   - [is_reputable_user](#is_reputable_user)
    - [get_current_recipient](#get_current_recipient)
    - [get_user_summary](#get_user_summary)
 4. [Event Schemas for Push Notifications](#event-schemas-for-push-notifications)
@@ -136,23 +137,25 @@ xdr.ScVal.scvVoid()
 
 ### `deposit`
 
-Submits the user's contribution for the current round.
+Submits the user's contribution for one or more rounds in a single ledger transaction.
 
 ```
 Function : deposit
 Arguments:
   [0] user      : Address
   [1] circle_id : u64
+  [2] rounds    : u32
 Returns  : void
 Auth     : user must sign
-Notes    : The token transfer is executed internally. The user must have
-           approved the contract to spend `amount` tokens beforehand.
+Notes    : The token transfer and member contribution-history update are
+           executed atomically. The user must have approved the contract to
+           spend `amount * rounds` tokens beforehand.
 ```
 
 **Pre-approval (SEP-41 `approve`):**
 
 ```js
-// Approve the SoroSusu contract to pull `amount` from the user's balance.
+// Approve the SoroSusu contract to pull `amount * rounds` from the user's balance.
 const approveOp = tokenContract.call(
   "approve",
   nativeToScVal(userAddress, { type: "address" }),
@@ -276,6 +279,23 @@ Member fields:
 
 ---
 
+### `is_reputable_user`
+
+Read-only Reputation-as-a-Service adapter for partner protocols. Returns only a
+boolean and does not expose circle, group, contribution, or vouching details.
+Missing or archived reputation data returns `false`.
+
+```
+Function : is_reputable_user
+Arguments:
+  [0] user : Address
+Returns  : bool  // true only when RI > 900 and defaults_count == 0
+Auth     : none
+Events   : none
+```
+
+---
+
 ### `get_current_recipient`
 
 Read-only. Returns the address that will receive the next payout, or `None` if no payout is pending.
@@ -390,6 +410,20 @@ Fired when a Soulbound Token credential is issued to a member.
 | data[2] | SbtStatus | `status` |
 
 **Push notification trigger:** "Congratulations! You earned a SoroSusu credential badge."
+
+---
+
+### Event: `ReputationBadgeUpdated`
+
+Fired when a reputation SBT is minted or its dynamic metadata changes.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| topic[0] | Symbol | `"ReputationBadgeUpdated"` |
+| topic[1] | u128 | SBT token ID |
+| data[0] | Address | Badge owner |
+| data[1] | SbtStatus | Current status or tier title |
+| data[2] | String | Updated IPFS metadata URI |
 
 ---
 

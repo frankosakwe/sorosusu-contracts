@@ -4,9 +4,7 @@
 // read_reputation() aggregates on-chain member behaviour (contribution history,
 // default record, vouching activity) into a single portable proof struct.
 
-#![no_std]
-
-use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
 // --- CONSTANTS ---
 
@@ -22,13 +20,21 @@ const RI_TIER_GOOD: u32 = 650;
 /// RI score considered "fair" — minimum for most integrations
 const RI_TIER_FAIR: u32 = 400;
 
+/// VIP partner threshold: callers qualify only when RI is strictly greater
+/// than this value and the account has no recorded defaults.
+pub const REPUTABLE_USER_RI_THRESHOLD: u32 = 900;
+
+/// Maximum CPU instructions accepted by the adapter benchmark.
+pub const REPUTABLE_USER_CPU_BUDGET: u64 = 5_000;
+
 // --- DATA KEYS ---
 
 #[contracttype]
 #[derive(Clone)]
 pub enum OracleDataKey {
-    MemberReputation(Address),   // ReputationRecord per member
-    ProofNonce(Address),         // Monotonically increasing nonce per address
+    MemberReputation(Address), // ReputationRecord per member
+    ProofNonce(Address),       // Monotonically increasing nonce per address
+    ReputableUser(Address),    // Derived VIP gate for cheap partner queries
 }
 
 // --- DATA STRUCTURES ---
@@ -67,7 +73,7 @@ pub struct ReputationProof {
     pub member: Address,
     pub ri_score: u32,
     pub tier: ReputationTier,
-    pub on_time_rate_bps: u32,    // (on_time / total) * 10_000
+    pub on_time_rate_bps: u32, // (on_time / total) * 10_000
     pub defaults_count: u32,
     pub circles_participated: u32,
     pub vouches_given: u32,
@@ -75,6 +81,10 @@ pub struct ReputationProof {
     pub generated_at: u64,
     pub nonce: u32,
 }
+
+/// Minimal public adapter for high-frequency partner queries.
+#[contract]
+pub struct SoroSusuReputationAdapter;
 
 // --- HELPERS ---
 
@@ -88,6 +98,10 @@ fn score_to_tier(score: u32) -> ReputationTier {
     } else {
         ReputationTier::Poor
     }
+}
+
+fn check_reputable_record(record: &ReputationRecord) -> bool {
+    record.ri_score > REPUTABLE_USER_RI_THRESHOLD && record.defaults_count == 0
 }
 
 // --- FUNCTIONS ---
@@ -119,9 +133,26 @@ pub fn update_reputation(
 
     env.storage()
         .instance()
-        .set(&OracleDataKey::MemberReputation(member), &record);
+        .set(&OracleDataKey::MemberReputation(member.clone()), &record);
+
+    let gate_key = OracleDataKey::ReputableUser(member);
+    if check_reputable_record(&record) {
+        env.storage().instance().set(&gate_key, &true);
+    } else {
+        env.storage().instance().remove(&gate_key);
+    }
 
     record
+}
+
+/// Archive a user's reputation data and its derived partner-query gate.
+pub fn archive_reputation(env: &Env, user: Address) {
+    env.storage()
+        .instance()
+        .remove(&OracleDataKey::MemberReputation(user.clone()));
+    env.storage()
+        .instance()
+        .remove(&OracleDataKey::ReputableUser(user));
 }
 
 /// Public oracle entrypoint: returns a standardised ReputationProof for a given address.
@@ -161,11 +192,32 @@ pub fn read_reputation(env: &Env, user: Address) -> Option<ReputationProof> {
     Some(proof)
 }
 
+/// Standardized read-only VIP adapter for partner protocols.
+///
+/// Returns true only when the user's derived reputation gate exists. The gate
+/// is updated atomically with the user's RI/default record, so this performs a
+/// single key-existence check, emits no events, and intentionally avoids
+/// returning group, circle, contribution, or vouching details. Missing or
+/// archived reputation data resolves to false.
+pub fn is_reputable_user(env: &Env, user: Address) -> bool {
+    env.storage()
+        .instance()
+        .has(&OracleDataKey::ReputableUser(user))
+}
+
 /// Check whether a given address meets a minimum RI threshold.
 /// Convenience wrapper for integrations that only need a boolean gate.
 pub fn meets_reputation_threshold(env: &Env, user: Address, min_ri: u32) -> bool {
     match read_reputation(env, user) {
         Some(proof) => proof.ri_score >= min_ri,
         None => false,
+    }
+}
+
+#[contractimpl]
+impl SoroSusuReputationAdapter {
+    /// Cross-contract entrypoint for Reputation-as-a-Service integrations.
+    pub fn is_reputable_user(env: Env, user: Address) -> bool {
+        is_reputable_user(&env, user)
     }
 }
