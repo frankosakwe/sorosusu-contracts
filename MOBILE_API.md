@@ -19,6 +19,7 @@ This document is the primary reference for developers building a SoroSusu-compat
    - [late_contribution](#late_contribution)
    - [get_circle](#get_circle)
    - [get_member](#get_member)
+   - [is_reputable_user](#is_reputable_user)
    - [get_current_recipient](#get_current_recipient)
    - [get_user_summary](#get_user_summary)
 4. [Event Schemas for Push Notifications](#event-schemas-for-push-notifications)
@@ -274,6 +275,23 @@ Member fields:
   status             : MemberStatus  // Active | Defaulted | Exited
   buddy              : Option<Address>
   guarantor          : Option<Address>
+```
+
+---
+
+### `is_reputable_user`
+
+Read-only Reputation-as-a-Service adapter for partner protocols. Returns only a
+boolean and does not expose circle, group, contribution, or vouching details.
+Missing or archived reputation data returns `false`.
+
+```
+Function : is_reputable_user
+Arguments:
+  [0] user : Address
+Returns  : bool  // true only when RI > 900 and defaults_count == 0
+Auth     : none
+Events   : none
 ```
 
 ---

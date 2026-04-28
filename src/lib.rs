@@ -15,6 +15,8 @@ pub mod juror_selection;
 pub mod passkey_auth;
 // Issue #380: Hierarchical Susu-Aggregation for Institutional Lending
 pub mod aggregate_credit;
+// Reputation-as-a-Service adapter for partner protocol VIP gates.
+pub mod reliability_oracle;
 
 // Issue #321: Maximum cycle duration cap (2 years in seconds) to prevent
 // integer overflow exploits and unbounded storage accumulation.

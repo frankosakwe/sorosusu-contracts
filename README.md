@@ -122,6 +122,9 @@ Sets user's payout preference for a circle (Direct Token vs Direct-to-Bank).
 #### `get_payout_preference(env: Env, user: Address, circle_id: u64) -> UserBankPreference`
 Retrieves user's payout preference for a circle.
 
+#### `is_reputable_user(env: Env, user: Address) -> bool`
+Read-only partner adapter that returns true only when the user's Reliability Index is greater than 900 and they have zero defaults. It emits no events and reveals no private group membership data.
+
 #### `deposit_for_user(env: Env, anchor_address: Address, user_address: Address, circle_id: u64, amount: u64, token: Address, fiat_reference: Symbol)`
 Deposits funds on behalf of a user via an anchor (for SEP-24 integration).
 
@@ -176,6 +179,9 @@ A specialized voting mechanism to grant extensions to members in distress, preve
 ## Analytics & Reputation Engines
 ### Credit Score Oracle
 Integrates on-chain and off-chain data to calculate a "DeFi Credit Score" based on contribution history.
+
+### Reputation-as-a-Service Adapter
+Partner protocols can call `is_reputable_user(address)` as a high-frequency VIP gate for under-collateralized lending, fee discounts, or other premium DeFi features. Archived or missing reputation records resolve to `false`.
 
 ### Reliability Index (RI) Whitepaper
 Detailed technical documentation is available in `RELIABILITY_INDEX_WHITEPAPER.md`, explaining how the RI is calculated, how fees are discounted, and how inactivity decay and identity gating are enforced.
