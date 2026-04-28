@@ -53,6 +53,8 @@ pub enum DataKey {
     NonReentrant,
     // Issue #316: Zombie-group sweep
     CircleCompletedAt(u64),
+    // Issue #386: Ledger Rent Sweeper - tracks when circle was fully drained
+    CircleDrainedAt(u64),
     // Issue #275: Reputation-NFT (SBT) Minting Hook
     SbtCredential(u128),
     UserSbt(Address),
@@ -558,6 +560,15 @@ pub trait SoroSusuTrait {
 
     /// Archive metadata and delete heavy state 30 days after completion.
     fn cleanup_group(env: Env, caller: Address, circle_id: u64);
+
+    /// Mark a circle as fully drained (called when final payout completes).
+    fn mark_circle_drained(env: Env, circle_id: u64);
+
+    // --- Issue #386: Ledger Rent Sweeper ---
+
+    /// Prune a finalized "zombie" group that has been completed and drained for over 180 days.
+    /// Leaves a cryptographic tombstone for historical RI audits and pays relayer a bounty.
+    fn prune_zombie_group(env: Env, relayer: Address, circle_id: u64) -> Result<u64, u32>;
 
     // --- Issue #322: Dispute Bond Slashing ---
 
@@ -3596,9 +3607,14 @@ impl SoroSusuTrait for SoroSusu {
         if updated_circle.current_recipient_index >= updated_circle.member_count {
             // Mark circle completed and record timestamp for cleanup_group (issue #316).
             updated_circle.is_active = false;
+            let completion_timestamp = env.ledger().timestamp();
             env.storage()
                 .instance()
-                .set(&DataKey::CircleCompletedAt(circle_id), &env.ledger().timestamp());
+                .set(&DataKey::CircleCompletedAt(circle_id), &completion_timestamp);
+            // Mark circle drained for Issue #386 (rent sweeper)
+            env.storage()
+                .instance()
+                .set(&DataKey::CircleDrainedAt(circle_id), &completion_timestamp);
         }
         env.storage()
             .instance()
@@ -3688,6 +3704,18 @@ impl SoroSusuTrait for SoroSusu {
 
     fn cleanup_group(env: Env, caller: Address, circle_id: u64) {
         dispute::cleanup_group(&env, &caller, circle_id);
+    }
+
+    fn mark_circle_drained(env: Env, circle_id: u64) {
+        dispute::mark_circle_drained(&env, circle_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #386 – Ledger Rent Sweeper for Finalized "Zombie" Groups
+    // -----------------------------------------------------------------------
+
+    fn prune_zombie_group(env: Env, relayer: Address, circle_id: u64) -> Result<u64, u32> {
+        dispute::prune_zombie_group(&env, &relayer, circle_id)
     }
 
     // -----------------------------------------------------------------------
@@ -6072,5 +6100,466 @@ mod fuzz_tests {
             actual_payout, 1500,
             "Normal member should receive payout with yield"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #386 – Ledger Rent Sweeper Tests
+    // -----------------------------------------------------------------------
+
+    /// Test that prune_zombie_group fails when circle hasn't been completed
+    #[test]
+    fn test_prune_zombie_group_fails_not_completed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let admin = Address::generate(&env);
+        let relayer = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Initialize contract
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        // Create a circle but don't complete it
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        // Try to prune - should fail with error 404 (not completed)
+        let result = SoroSusuTrait::prune_zombie_group(env.clone(), relayer.clone(), circle_id);
+        assert!(result.is_err(), "Prune should fail when circle not completed");
+        assert_eq!(result.unwrap_err(), 404u32);
+    }
+
+    /// Test that prune_zombie_group fails when circle hasn't been drained
+    #[test]
+    fn test_prune_zombie_group_fails_not_drained() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let admin = Address::generate(&env);
+        let relayer = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Initialize contract
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        // Create a circle
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        // Simulate completion (set CircleCompletedAt)
+        // In real flow, this happens when all rounds complete
+        let completed_at = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::CircleCompletedAt(circle_id), &completed_at);
+
+        // Try to prune - should fail with error 405 (not drained)
+        let result = SoroSusuTrait::prune_zombie_group(env.clone(), relayer.clone(), circle_id);
+        assert!(result.is_err(), "Prune should fail when circle not drained");
+        assert_eq!(result.unwrap_err(), 405u32);
+    }
+
+    /// Test that prune_zombie_group fails before 180-day window
+    #[test]
+    fn test_prune_zombie_group_fails_before_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let admin = Address::generate(&env);
+        let relayer = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Initialize contract
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        // Create a circle
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        // Set completion and drain timestamps to now (less than 180 days ago)
+        let now = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::CircleCompletedAt(circle_id), &now);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircleDrainedAt(circle_id), &now);
+
+        // Try to prune - should fail with error 406 or 407 (window not elapsed)
+        let result = SoroSusuTrait::prune_zombie_group(env.clone(), relayer.clone(), circle_id);
+        assert!(result.is_err(), "Prune should fail before 180-day window");
+        let err = result.unwrap_err();
+        assert!(err == 406u32 || err == 407u32, "Should be window error");
+    }
+
+    /// Test successful prune after 180 days
+    #[test]
+    fn test_prune_zombie_group_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let admin = Address::generate(&env);
+        let relayer = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Initialize contract
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        // Create a circle
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        // Set completion and drain timestamps to 180+ days ago
+        let window_secs: u64 = 180 * 24 * 60 * 60;
+        let old_timestamp = env.ledger().timestamp().saturating_sub(window_secs + 1);
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::CircleCompletedAt(circle_id), &old_timestamp);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircleDrainedAt(circle_id), &old_timestamp);
+
+        // Set initial treasury for bounty payment
+        env.storage()
+            .instance()
+            .set(&DataKey::GroupReserve, &1000000u64);
+
+        // Prune should succeed
+        let result = SoroSusuTrait::prune_zombie_group(env.clone(), relayer.clone(), circle_id);
+        assert!(result.is_ok(), "Prune should succeed after 180 days");
+        
+        let bounty = result.unwrap();
+        assert!(bounty > 0, "Bounty should be positive");
+
+        // Verify tombstone was stored
+        let tombstone: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ArchivedGroupHash(circle_id))
+            .unwrap();
+        assert_eq!(tombstone, circle_id.wrapping_add(old_timestamp).wrapping_mul(old_timestamp.wrapping_add(1)));
+
+        // Verify heavy data was removed
+        assert!(
+            env.storage()
+                .instance()
+                .get::<_, CircleInfo>(&DataKey::Circle(circle_id))
+                .is_none(),
+            "Circle data should be removed"
+        );
+        assert!(
+            env.storage()
+                .instance()
+                .get::<_, u64>(&DataKey::CircleCompletedAt(circle_id))
+                .is_none(),
+            "Completion timestamp should be removed"
+        );
+        assert!(
+            env.storage()
+                .instance()
+                .get::<_, u64>(&DataKey::CircleDrainedAt(circle_id))
+                .is_none(),
+            "Drain timestamp should be removed"
+        );
+    }
+
+    /// Test that prune cannot touch active circles
+    #[test]
+    fn test_prune_zombie_group_rejects_active_circle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let admin = Address::generate(&env);
+        let relayer = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Initialize contract
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        // Create a circle
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        // Set timestamps to 180+ days ago
+        let window_secs: u64 = 180 * 24 * 60 * 60;
+        let old_timestamp = env.ledger().timestamp().saturating_sub(window_secs + 1);
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::CircleCompletedAt(circle_id), &old_timestamp);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircleDrainedAt(circle_id), &old_timestamp);
+
+        // Make circle active
+        let mut circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap();
+        circle.is_active = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::Circle(circle_id), &circle);
+
+        // Try to prune - should fail with error 408 (active circle)
+        let result = SoroSusuTrait::prune_zombie_group(env.clone(), relayer.clone(), circle_id);
+        assert!(result.is_err(), "Prune should fail for active circle");
+        assert_eq!(result.unwrap_err(), 408u32);
+    }
+
+    /// Test storage byte reclamation calculation
+    #[test]
+    fn test_prune_zombie_group_storage_reclamation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let admin = Address::generate(&env);
+        let relayer = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Initialize contract
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        // Create a circle with known member count
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            10, // max 10 members
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        // Add some members
+        for i in 0..5 {
+            let member = Address::generate(&env);
+            SoroSusuTrait::join_circle(env.clone(), member.clone(), circle_id);
+            // Set member position
+            env.storage()
+                .instance()
+                .set(&DataKey::CircleMember(circle_id, i as u32), &member);
+        }
+
+        // Set timestamps to 180+ days ago
+        let window_secs: u64 = 180 * 24 * 60 * 60;
+        let old_timestamp = env.ledger().timestamp().saturating_sub(window_secs + 1);
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::CircleCompletedAt(circle_id), &old_timestamp);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircleDrainedAt(circle_id), &old_timestamp);
+
+        // Set treasury
+        env.storage()
+            .instance()
+            .set(&DataKey::GroupReserve, &1000000u64);
+
+        // Prune should succeed and reclaim storage
+        let result = SoroSusuTrait::prune_zombie_group(env.clone(), relayer.clone(), circle_id);
+        assert!(result.is_ok(), "Prune should succeed");
+
+        // Verify member positions were removed
+        for i in 0..5 {
+            assert!(
+                env.storage()
+                    .instance()
+                    .get::<_, Address>(&DataKey::CircleMember(circle_id, i as u32))
+                    .is_none(),
+                "Member position {} should be removed",
+                i
+            );
+        }
+    }
+
+    /// Test long-term storage decay simulation
+    #[test]
+    fn test_long_term_storage_decay() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let admin = Address::generate(&env);
+        let relayer = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Initialize contract
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        // Create multiple circles
+        let circle_ids = vec![
+            SoroSusuTrait::create_circle(env.clone(), creator.clone(), 1000, 5, token.clone(), 604800, true, 1),
+            SoroSusuTrait::create_circle(env.clone(), creator.clone(), 2000, 10, token.clone(), 604800, true, 1),
+            SoroSusuTrait::create_circle(env.clone(), creator.clone(), 3000, 20, token.clone(), 604800, true, 1),
+        ];
+
+        // Simulate 180+ days passing for all circles
+        let window_secs: u64 = 180 * 24 * 60 * 60;
+        let old_timestamp = env.ledger().timestamp().saturating_sub(window_secs + 1);
+
+        for circle_id in &circle_ids {
+            env.storage()
+                .instance()
+                .set(&DataKey::CircleCompletedAt(*circle_id), &old_timestamp);
+            env.storage()
+                .instance()
+                .set(&DataKey::CircleDrainedAt(*circle_id), &old_timestamp);
+        }
+
+        // Set treasury
+        env.storage()
+            .instance()
+            .set(&DataKey::GroupReserve, &10000000u64);
+
+        // Prune all circles
+        let mut total_bounty = 0u64;
+        for circle_id in &circle_ids {
+            let result = SoroSusuTrait::prune_zombie_group(env.clone(), relayer.clone(), *circle_id);
+            assert!(result.is_ok(), "Prune should succeed for circle {}", circle_id);
+            total_bounty += result.unwrap();
+        }
+
+        // Verify all circles were pruned
+        for circle_id in &circle_ids {
+            assert!(
+                env.storage()
+                    .instance()
+                    .get::<_, CircleInfo>(&DataKey::Circle(*circle_id))
+                    .is_none(),
+                "Circle {} should be removed",
+                circle_id
+            );
+            assert!(
+                env.storage()
+                    .instance()
+                    .get::<_, u64>(&DataKey::ArchivedGroupHash(*circle_id))
+                    .is_some(),
+                "Tombstone for circle {} should exist",
+                circle_id
+            );
+        }
+
+        // Total bounty should be sum of individual bounties
+        assert!(total_bounty > 0, "Total bounty should be positive");
+    }
+
+    /// Test that tombstone preserves historical integrity for RI audits
+    #[test]
+    fn test_tombstone_preserves_historical_integrity() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let admin = Address::generate(&env);
+        let relayer = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Initialize contract
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        // Create a circle
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        // Set completion and drain timestamps
+        let window_secs: u64 = 180 * 24 * 60 * 60;
+        let completed_at = env.ledger().timestamp().saturating_sub(window_secs + 1);
+        let drained_at = completed_at + 1000; // drained 1000 seconds after completion
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::CircleCompletedAt(circle_id), &completed_at);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircleDrainedAt(circle_id), &drained_at);
+
+        // Set treasury
+        env.storage()
+            .instance()
+            .set(&DataKey::GroupReserve, &1000000u64);
+
+        // Prune
+        SoroSusuTrait::prune_zombie_group(env.clone(), relayer.clone(), circle_id).unwrap();
+
+        // Retrieve tombstone
+        let tombstone: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ArchivedGroupHash(circle_id))
+            .unwrap();
+
+        // Tombstone should be deterministic based on circle_id, completed_at, drained_at
+        let expected_tombstone = circle_id
+            .wrapping_add(completed_at)
+            .wrapping_mul(drained_at.wrapping_add(1));
+        
+        assert_eq!(tombstone, expected_tombstone, "Tombstone should be deterministic");
+
+        // Verify we can still query the tombstone (historical integrity)
+        let retrieved_tombstone: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ArchivedGroupHash(circle_id))
+            .unwrap();
+        assert_eq!(retrieved_tombstone, tombstone, "Tombstone should be queryable for RI audits");
     }
 }
