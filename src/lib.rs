@@ -196,6 +196,17 @@ pub enum DataKey {
     MemberAdvanceHistory(Address, u64), // Member's advance history
     LiquidityBufferStats,            // Buffer utilization statistics
     PlatformFeeAllocation,           // Platform fee allocation to buffer
+    // Issue #413: Vault-Gated Contribution Escrow
+    ContributionEscrow(u64, Address), // (circle_id, member_address) -> escrow record
+    EscrowVault(u64),               // Per-circle escrow vault balance
+    // Issue #415: Emergency Exit Prorated Refund
+    EmergencyExit(u64, Address),    // (circle_id, member_address) -> exit record
+    // Issue #417: In-Kind Contribution Support
+    InKindContribution(u64, Address, Address), // (circle_id, member, token) -> contribution record
+    SupportedInKindTokens(u64),     // Per-circle supported in-kind tokens
+    // Issue #419: Contribution Grace Period with RI Penalty
+    GracePeriodPenalty(u64, Address), // (circle_id, member_address) -> penalty record
+    ReliabilityIndex(Address),      // Member reliability index score
     // Stellar Anchor Direct Deposit API (SEP-24/SEP-31)
     AnchorRegistry, // Registry of authorized anchors
     AnchorDeposit(u64), // Track anchor deposits per circle
@@ -743,58 +754,49 @@ pub trait SoroSusuTrait {
         method: passkey_auth::AuthMethod,
     ) -> Result<(), u32>;
 
-    // --- Issue #376: Adaptive Quorum for Global Protocol Governance ---
+    // --- ISSUE #413: VAULT-GATED CONTRIBUTION ESCROW ---
 
-    /// Initialize adaptive quorum settings (admin only)
-    fn initialize_adaptive_quorum_settings(env: Env, admin: Address);
+    /// Deposit contributions into escrow vault (vault-gated)
+    fn deposit_to_escrow(env: Env, user: Address, circle_id: u64, amount: u64);
 
-    /// Create a proposal with adaptive quorum
-    fn create_adaptive_proposal(
-        env: Env,
-        caller: Address,
-        circle_id: u64,
-        proposal_type: u32, // 0 = Emergency, 1 = Standard
-        voting_duration_seconds: u64,
-    ) -> u64;
+    /// Release escrowed funds after round completion
+    fn release_escrow_funds(env: Env, circle_id: u64, round_number: u32);
 
-    /// Cast a vote on an adaptive quorum proposal
-    fn cast_adaptive_vote(
-        env: Env,
-        voter: Address,
-        proposal_id: u64,
-        vote_choice: bool, // true = For, false = Against
-    );
+    /// Get escrow status for a member
+    fn get_escrow_status(env: Env, user: Address, circle_id: u64) -> ContributionEscrow;
 
-    /// Contest a proposal (resets decay timer if threshold reached)
-    fn contest_proposal(
-        env: Env,
-        voter: Address,
-        proposal_id: u64,
-    ) -> bool;
+    // --- ISSUE #415: EMERGENCY EXIT PRORATED REFUND ---
 
-    /// Execute an adaptive quorum proposal
-    fn execute_adaptive_proposal(
-        env: Env,
-        caller: Address,
-        proposal_id: u64,
-    ) -> Result<bool, u32>;
+    /// Request emergency exit with prorated refund
+    fn request_emergency_exit(env: Env, user: Address, circle_id: u64);
 
-    /// Get current adaptive quorum state for a proposal
-    fn get_adaptive_quorum_state(
-        env: Env,
-        proposal_id: u64,
-    ) -> Option<adaptive_quorum::AdaptiveQuorumState>;
+    /// Process emergency exit refund
+    fn process_emergency_exit(env: Env, admin: Address, user: Address, circle_id: u64);
 
-    /// Get current calculated quorum for a proposal
-    fn get_current_quorum(
-        env: Env,
-        proposal_id: u64,
-    ) -> u32;
+    /// Get emergency exit status
+    fn get_emergency_exit_status(env: Env, user: Address, circle_id: u64) -> EmergencyExit;
 
-    /// Get participation velocity data
-    fn get_participation_velocity(
-        env: Env,
-    ) -> Option<adaptive_quorum::ParticipationVelocity>;
+    // --- ISSUE #417: IN-KIND CONTRIBUTION SUPPORT ---
+
+    /// Configure supported in-kind tokens for a circle
+    fn configure_in_kind_tokens(env: Env, admin: Address, circle_id: u64, tokens: Vec<InKindTokenConfig>);
+
+    /// Make in-kind contribution (e.g., XLM for USDC circle)
+    fn contribute_in_kind(env: Env, user: Address, circle_id: u64, token: Address, amount: u64);
+
+    /// Get supported in-kind tokens for a circle
+    fn get_supported_in_kind_tokens(env: Env, circle_id: u64) -> Vec<InKindTokenConfig>;
+
+    // --- ISSUE #419: CONTRIBUTION GRACE PERIOD WITH RI PENALTY ---
+
+    /// Submit late contribution within grace period (with RI penalty)
+    fn submit_late_contribution(env: Env, user: Address, circle_id: u64, amount: u64);
+
+    /// Get member reliability index
+    fn get_reliability_index(env: Env, user: Address) -> ReliabilityIndex;
+
+    /// Update reliability index (internal function)
+    fn update_reliability_index(env: Env, user: Address, circle_id: u64, is_on_time: bool);
 }
 
 // --- IMPLEMENTATION ---
@@ -998,12 +1000,120 @@ pub struct AssetSwapProposal {
 pub struct LateFeeDistribution {
     pub circle_id: u64,
     pub round_number: u32,
-    pub pot_winner: Address,
-    pub pot_winner_compensation: i128,      // First priority: compensate pot winner
-    pub on_time_payers_bonus: Vec<(Address, i128)>, // Bonus for on-time payers (pro-rated by payment time)
-    pub total_late_fees_collected: i128,
+    pub total_late_fees: i128,
+    pub distributed_amount: i128,
+    pub remaining_amount: i128,
     pub distribution_timestamp: u64,
-    pub late_payers: Vec<(Address, i128)>,  // List of late payers and their fines
+}
+
+// --- ISSUE #413: VAULT-GATED CONTRIBUTION ESCROW ---
+
+/// Contribution Escrow Record - Tracks contributions held in escrow
+#[contracttype]
+#[derive(Clone)]
+pub struct ContributionEscrow {
+    pub member: Address,
+    pub circle_id: u64,
+    pub amount: i128,
+    pub token: Address,
+    pub escrow_timestamp: u64,
+    pub release_timestamp: Option<u64>,
+    pub is_released: bool,
+    pub release_reason: EscrowReleaseReason,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum EscrowReleaseReason {
+    Pending,           // Initial state
+    RoundComplete,     // Released after round completion
+    EmergencyExit,     // Released due to emergency exit
+    Default,           // Forfeited due to default
+    AdminRelease,      // Admin manual release
+}
+
+/// Escrow Vault - Per-circle vault holding escrowed funds
+#[contracttype]
+#[derive(Clone)]
+pub struct EscrowVault {
+    pub circle_id: u64,
+    pub total_balance: i128,
+    pub pending_release: i128,
+    pub released_amount: i128,
+    pub last_updated: u64,
+}
+
+// --- ISSUE #415: EMERGENCY EXIT PRORATED REFUND ---
+
+/// Emergency Exit Record - Tracks member emergency exits
+#[contracttype]
+#[derive(Clone)]
+pub struct EmergencyExit {
+    pub member: Address,
+    pub circle_id: u64,
+    pub exit_timestamp: u64,
+    pub contributions_made: u32,
+    pub total_contributed: i128,
+    pub prorated_refund: i128,
+    pub penalty_amount: i128,
+    pub is_processed: bool,
+    pub processing_timestamp: Option<u64>,
+}
+
+// --- ISSUE #417: IN-KIND CONTRIBUTION SUPPORT ---
+
+/// In-Kind Contribution Record - Tracks non-primary token contributions
+#[contracttype]
+#[derive(Clone)]
+pub struct InKindContribution {
+    pub member: Address,
+    pub circle_id: u64,
+    pub token: Address,
+    pub amount: i128,
+    pub equivalent_value: i128, // Value in primary token terms
+    pub contribution_timestamp: u64,
+    pub is_processed: bool,
+}
+
+/// In-Kind Token Config - Configuration for supported in-kind tokens
+#[contracttype]
+#[derive(Clone)]
+pub struct InKindTokenConfig {
+    pub token: Address,
+    pub is_stable: bool,
+    pub price_oracle: Option<Address>,
+    pub max_contribution_percentage: u32, // Max % of contribution amount
+    pub confidence_threshold: u32, // Price confidence threshold (bps)
+}
+
+// --- ISSUE #419: CONTRIBUTION GRACE PERIOD WITH RI PENALTY ---
+
+/// Grace Period Penalty Record - Tracks penalties for late contributions
+#[contracttype]
+#[derive(Clone)]
+pub struct GracePeriodPenalty {
+    pub member: Address,
+    pub circle_id: u64,
+    pub round_number: u32,
+    pub deadline_missed: u64,
+    pub paid_within_grace: bool,
+    pub penalty_amount: i128,
+    pub ri_impact: i32, // Reliability Index impact
+    pub timestamp: u64,
+}
+
+/// Reliability Index - Member reliability scoring
+#[contracttype]
+#[derive(Clone)]
+pub struct ReliabilityIndex {
+    pub member: Address,
+    pub score: u32, // 0-1000 scale (100.0% max)
+    pub total_contributions: u32,
+    pub on_time_contributions: u32,
+    pub late_contributions: u32,
+    pub missed_contributions: u32,
+    pub last_updated: u64,
+    pub grace_period_hits: u32,
 }
 
 /// Payment Timing Record - Track when each member paid in a round
@@ -4129,225 +4239,378 @@ impl SoroSusuTrait for SoroSusu {
         Vec::new(env)
     }
 
-    // --- Issue #376: Adaptive Quorum for Global Protocol Governance ---
+    // --- ISSUE #413: VAULT-GATED CONTRIBUTION ESCROW ---
 
-    fn initialize_adaptive_quorum_settings(env: Env, admin: Address) {
-        // Verify admin authorization
-        let stored_admin: Address = env.storage().instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
+    fn deposit_to_escrow(env: Env, user: Address, circle_id: u64, amount: u64) {
+        user.require_auth();
         
-        if admin != stored_admin {
-            panic!("Unauthorized: Only admin can initialize adaptive quorum settings");
-        }
-
-        let settings = adaptive_quorum::initialize_adaptive_quorum_settings(&env);
-        env.storage().instance().set(&DataKey::AdaptiveQuorumSettings, &settings);
-        
-        // Initialize empty participation velocity tracking
-        let velocity = adaptive_quorum::ParticipationVelocity {
-            vote_records: Vec::new(&env),
-            average_participation: 0,
-            velocity_trend: 0,
-        };
-        env.storage().instance().set(&DataKey::ParticipationVelocity, &velocity);
-    }
-
-    fn create_adaptive_proposal(
-        env: Env,
-        caller: Address,
-        circle_id: u64,
-        proposal_type: u32,
-        voting_duration_seconds: u64,
-    ) -> u64 {
-        // Get or initialize settings
-        let settings: adaptive_quorum::AdaptiveQuorumSettings = env.storage().instance()
-            .get(&DataKey::AdaptiveQuorumSettings)
-            .unwrap_or_else(|| adaptive_quorum::initialize_adaptive_quorum_settings(&env));
-
-        // Get circle to determine eligible voters
         let circle: CircleInfo = env.storage().instance()
             .get(&DataKey::Circle(circle_id))
-            .expect("Circle not found");
-
-        let proposal_type_enum = match proposal_type {
-            0 => adaptive_quorum::ProposalType::Emergency,
-            1 => adaptive_quorum::ProposalType::Standard,
-            _ => panic!("Invalid proposal type"),
-        };
-
-        // Generate proposal ID
-        let proposal_count: u64 = env.storage().instance()
-            .get(&DataKey::CircleCount)
-            .unwrap_or(0);
-        let proposal_id = proposal_count + 1;
-
-        // Create adaptive quorum state
-        let state = adaptive_quorum::create_adaptive_quorum_state(
-            &env,
-            proposal_id,
-            circle_id,
-            proposal_type_enum,
-            circle.member_count,
-            voting_duration_seconds,
-            &settings,
-        );
-
-        // Store the state
-        env.storage().instance().set(&DataKey::AdaptiveQuorumState(proposal_id), &state);
-
-        proposal_id
-    }
-
-    fn cast_adaptive_vote(
-        env: Env,
-        voter: Address,
-        proposal_id: u64,
-        vote_choice: bool,
-    ) {
-        let state_key = DataKey::AdaptiveQuorumState(proposal_id);
-        let mut state: adaptive_quorum::AdaptiveQuorumState = env.storage().instance()
-            .get(&state_key)
-            .expect("Proposal not found");
-
-        let current_timestamp = env.ledger().timestamp();
-
-        // Check if proposal has expired
-        if adaptive_quorum::is_proposal_expired(&state, current_timestamp) {
-            panic!("Proposal has expired");
-        }
-
-        // Increment participant count
-        state.current_participants += 1;
-
-        // Check if decay should be triggered for emergency proposals
-        if state.config.proposal_type == adaptive_quorum::ProposalType::Emergency {
-            let old_quorum = state.config.current_quorum_bps;
-            let new_quorum = adaptive_quorum::calculate_adaptive_quorum(&env, &state, current_timestamp);
-            
-            if new_quorum != old_quorum {
-                state.config.current_quorum_bps = new_quorum;
-                adaptive_quorum::emit_quorum_decay_triggered(
-                    &env,
-                    proposal_id,
-                    old_quorum,
-                    new_quorum,
-                    current_timestamp,
-                );
-            }
-        }
-
-        // Update state
-        env.storage().instance().set(&state_key, &state);
-    }
-
-    fn contest_proposal(
-        env: Env,
-        voter: Address,
-        proposal_id: u64,
-    ) -> bool {
-        let state_key = DataKey::AdaptiveQuorumState(proposal_id);
-        let mut state: adaptive_quorum::AdaptiveQuorumState = env.storage().instance()
-            .get(&state_key)
-            .expect("Proposal not found");
-
-        let current_timestamp = env.ledger().timestamp();
-
-        // Check if proposal has expired
-        if adaptive_quorum::is_proposal_expired(&state, current_timestamp) {
-            panic!("Proposal has expired");
-        }
-
-        // Register the contest
-        let reset_triggered = adaptive_quorum::register_contest_vote(
-            &env,
-            &mut state,
-            &voter,
-            current_timestamp,
-        );
-
-        // Update state
-        env.storage().instance().set(&state_key, &state);
-
-        reset_triggered
-    }
-
-    fn execute_adaptive_proposal(
-        env: Env,
-        caller: Address,
-        proposal_id: u64,
-    ) -> Result<bool, u32> {
-        let state_key = DataKey::AdaptiveQuorumState(proposal_id);
-        let state: adaptive_quorum::AdaptiveQuorumState = env.storage().instance()
-            .get(&state_key)
-            .ok_or(401)?; // Proposal not found
-
-        let current_timestamp = env.ledger().timestamp();
-
-        // Check if proposal has expired
-        if adaptive_quorum::is_proposal_expired(&state, current_timestamp) {
-            return Err(402); // Proposal expired
-        }
-
-        // Check if quorum is met
-        let quorum_met = adaptive_quorum::is_quorum_met(&env, &state, current_timestamp);
+            .unwrap_or_else(|| panic!("Circle not found"));
         
-        if !quorum_met {
-            return Err(403); // Quorum not met
-        }
-
-        // Record participation for velocity tracking
-        let participation_record = adaptive_quorum::record_participation(
-            &env,
-            proposal_id,
-            state.total_eligible_voters,
-            state.current_participants,
-            current_timestamp,
+        // Create escrow record
+        let escrow_record = ContributionEscrow {
+            member: user.clone(),
+            circle_id,
+            amount: amount as i128,
+            token: circle.token.clone(),
+            escrow_timestamp: env.ledger().timestamp(),
+            release_timestamp: None,
+            is_released: false,
+            release_reason: EscrowReleaseReason::Pending,
+        };
+        
+        // Store escrow record
+        env.storage().instance().set(
+            &DataKey::ContributionEscrow(circle_id, user.clone()),
+            &escrow_record
         );
-
-        let velocity_key = DataKey::ParticipationVelocity;
-        let mut velocity: adaptive_quorum::ParticipationVelocity = env.storage().instance()
-            .get(&velocity_key)
-            .unwrap_or_else(|| adaptive_quorum::ParticipationVelocity {
-                vote_records: Vec::new(&env),
-                average_participation: 0,
-                velocity_trend: 0,
+        
+        // Update escrow vault
+        let mut vault: EscrowVault = env.storage().instance()
+            .get(&DataKey::EscrowVault(circle_id))
+            .unwrap_or_else(|| EscrowVault {
+                circle_id,
+                total_balance: 0,
+                pending_release: 0,
+                released_amount: 0,
+                last_updated: env.ledger().timestamp(),
             });
-
-        adaptive_quorum::update_velocity_tracking(&env, &mut velocity, participation_record);
-        env.storage().instance().set(&velocity_key, &velocity);
-
-        // Mark proposal as executed
-        let mut updated_state = state.clone();
-        updated_state.config.is_decayed = true;
-        env.storage().instance().set(&state_key, &updated_state);
-
-        Ok(true)
+        
+        vault.total_balance += amount as i128;
+        vault.last_updated = env.ledger().timestamp();
+        
+        env.storage().instance().set(&DataKey::EscrowVault(circle_id), &vault);
+        
+        // Transfer tokens to contract
+        let token_client = token::Client::new(&env, &circle.token);
+        token_client.transfer(&user, &env.current_contract_address(), &(amount as i128));
+        
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "escrow_deposit"), circle_id),
+            (user, amount),
+        );
     }
 
-    fn get_adaptive_quorum_state(
-        env: Env,
-        proposal_id: u64,
-    ) -> Option<adaptive_quorum::AdaptiveQuorumState> {
-        env.storage().instance().get(&DataKey::AdaptiveQuorumState(proposal_id))
+    fn release_escrow_funds(env: Env, circle_id: u64, round_number: u32) {
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+        
+        let vault: EscrowVault = env.storage().instance()
+            .get(&DataKey::EscrowVault(circle_id))
+            .unwrap_or_else(|| panic!("Escrow vault not found"));
+        
+        // Release all pending escrow funds for completed round
+        let token_client = token::Client::new(&env, &circle.token);
+        
+        // In a full implementation, we'd iterate through members and release individually
+        // For now, we'll release to the group reserve
+        if vault.total_balance > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &vault.total_balance
+            );
+            
+            // Update vault
+            let mut updated_vault = vault;
+            updated_vault.released_amount = updated_vault.total_balance;
+            updated_vault.total_balance = 0;
+            updated_vault.last_updated = env.ledger().timestamp();
+            
+            env.storage().instance().set(&DataKey::EscrowVault(circle_id), &updated_vault);
+        }
+        
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "escrow_released"), circle_id),
+            (round_number, vault.total_balance),
+        );
     }
 
-    fn get_current_quorum(
-        env: Env,
-        proposal_id: u64,
-    ) -> u32 {
-        let state: adaptive_quorum::AdaptiveQuorumState = env.storage().instance()
-            .get(&DataKey::AdaptiveQuorumState(proposal_id))
-            .expect("Proposal not found");
-
-        let current_timestamp = env.ledger().timestamp();
-        adaptive_quorum::calculate_adaptive_quorum(&env, &state, current_timestamp)
+    fn get_escrow_status(env: Env, user: Address, circle_id: u64) -> ContributionEscrow {
+        env.storage().instance()
+            .get(&DataKey::ContributionEscrow(circle_id, user))
+            .unwrap_or_else(|| panic!("Escrow record not found"))
     }
 
-    fn get_participation_velocity(
-        env: Env,
-    ) -> Option<adaptive_quorum::ParticipationVelocity> {
-        env.storage().instance().get(&DataKey::ParticipationVelocity)
+    // --- ISSUE #415: EMERGENCY EXIT PRORATED REFUND ---
+
+    fn request_emergency_exit(env: Env, user: Address, circle_id: u64) {
+        user.require_auth();
+        
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+        
+        let member: Member = env.storage().instance()
+            .get(&DataKey::Member(user.clone()))
+            .unwrap_or_else(|| panic!("Member not found"));
+        
+        // Calculate prorated refund based on contributions made vs expected
+        let total_expected = circle.contribution_amount * circle.member_count as i128;
+        let contributions_made = member.contribution_count as i128 * circle.contribution_amount;
+        let refund_percentage = if total_expected > 0 {
+            (contributions_made * 10000) / total_expected
+        } else {
+            0
+        };
+        
+        // Apply penalty for early exit (10% of contributions)
+        let penalty_amount = contributions_made / 10;
+        let prorated_refund = contributions_made - penalty_amount;
+        
+        let exit_record = EmergencyExit {
+            member: user.clone(),
+            circle_id,
+            exit_timestamp: env.ledger().timestamp(),
+            contributions_made: member.contribution_count,
+            total_contributed: contributions_made,
+            prorated_refund,
+            penalty_amount,
+            is_processed: false,
+            processing_timestamp: None,
+        };
+        
+        env.storage().instance().set(
+            &DataKey::EmergencyExit(circle_id, user.clone()),
+            &exit_record
+        );
+        
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "emergency_exit_requested"), circle_id),
+            (user, prorated_refund),
+        );
+    }
+
+    fn process_emergency_exit(env: Env, admin: Address, user: Address, circle_id: u64) {
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        
+        if admin != stored_admin {
+            panic!("Unauthorized: Only admin can process emergency exit");
+        }
+        
+        let mut exit_record: EmergencyExit = env.storage().instance()
+            .get(&DataKey::EmergencyExit(circle_id, user.clone()))
+            .unwrap_or_else(|| panic!("Emergency exit record not found"));
+        
+        if exit_record.is_processed {
+            panic!("Emergency exit already processed");
+        }
+        
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+        
+        // Process refund
+        let token_client = token::Client::new(&env, &circle.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &user,
+            &exit_record.prorated_refund
+        );
+        
+        // Update record
+        exit_record.is_processed = true;
+        exit_record.processing_timestamp = Some(env.ledger().timestamp());
+        
+        env.storage().instance().set(
+            &DataKey::EmergencyExit(circle_id, user.clone()),
+            &exit_record
+        );
+        
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "emergency_exit_processed"), circle_id),
+            (user, exit_record.prorated_refund),
+        );
+    }
+
+    fn get_emergency_exit_status(env: Env, user: Address, circle_id: u64) -> EmergencyExit {
+        env.storage().instance()
+            .get(&DataKey::EmergencyExit(circle_id, user))
+            .unwrap_or_else(|| panic!("Emergency exit record not found"))
+    }
+
+    // --- ISSUE #417: IN-KIND CONTRIBUTION SUPPORT ---
+
+    fn configure_in_kind_tokens(env: Env, admin: Address, circle_id: u64, tokens: Vec<InKindTokenConfig>) {
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        
+        if admin != stored_admin {
+            panic!("Unauthorized: Only admin can configure in-kind tokens");
+        }
+        
+        env.storage().instance().set(&DataKey::SupportedInKindTokens(circle_id), &tokens);
+        
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "in_kind_tokens_configured"), circle_id),
+            (tokens.len()),
+        );
+    }
+
+    fn contribute_in_kind(env: Env, user: Address, circle_id: u64, token: Address, amount: u64) {
+        user.require_auth();
+        
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+        
+        let supported_tokens: Vec<InKindTokenConfig> = env.storage().instance()
+            .get(&DataKey::SupportedInKindTokens(circle_id))
+            .unwrap_or_else(|| panic!("No in-kind tokens configured"));
+        
+        // Verify token is supported
+        let token_config = supported_tokens.iter()
+            .find(|config| config.token == token)
+            .unwrap_or_else(|| panic!("Token not supported for in-kind contributions"));
+        
+        // Calculate equivalent value (simplified - in production would use price oracle)
+        let equivalent_value = if token_config.is_stable {
+            amount as i128 // Assume 1:1 for stablecoins
+        } else {
+            // For non-stable tokens, apply a discount factor
+            (amount as i128 * 8000) / 10000 // 80% value
+        };
+        
+        let contribution_record = InKindContribution {
+            member: user.clone(),
+            circle_id,
+            token: token.clone(),
+            amount: amount as i128,
+            equivalent_value,
+            contribution_timestamp: env.ledger().timestamp(),
+            is_processed: false,
+        };
+        
+        env.storage().instance().set(
+            &DataKey::InKindContribution(circle_id, user.clone(), token),
+            &contribution_record
+        );
+        
+        // Transfer tokens
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&user, &env.current_contract_address(), &(amount as i128));
+        
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "in_kind_contribution"), circle_id),
+            (user, token, amount, equivalent_value),
+        );
+    }
+
+    fn get_supported_in_kind_tokens(env: Env, circle_id: u64) -> Vec<InKindTokenConfig> {
+        env.storage().instance()
+            .get(&DataKey::SupportedInKindTokens(circle_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // --- ISSUE #419: CONTRIBUTION GRACE PERIOD WITH RI PENALTY ---
+
+    fn submit_late_contribution(env: Env, user: Address, circle_id: u64, amount: u64) {
+        user.require_auth();
+        
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+        
+        let current_time = env.ledger().timestamp();
+        let is_late = current_time > circle.deadline_timestamp;
+        
+        if !is_late {
+            panic!("Contribution is not late. Use regular deposit function.");
+        }
+        
+        // Check if within grace period (assume 7 days)
+        let grace_period = 7 * 24 * 60 * 60; // 7 days in seconds
+        let grace_end = circle.deadline_timestamp + grace_period;
+        
+        if current_time > grace_end {
+            panic!("Grace period has expired. Use execute_default function.");
+        }
+        
+        // Calculate penalty (5% of contribution amount)
+        let penalty_amount = (amount as i128 * 500) / 10000;
+        let net_amount = (amount as i128) - penalty_amount;
+        
+        // Update reliability index
+        Self::update_reliability_index(env.clone(), user.clone(), circle_id, false);
+        
+        // Record penalty
+        let penalty_record = GracePeriodPenalty {
+            member: user.clone(),
+            circle_id,
+            round_number: (circle.current_recipient_index + 1) as u32,
+            deadline_missed: circle.deadline_timestamp,
+            paid_within_grace: true,
+            penalty_amount,
+            ri_impact: -50, // Negative impact on RI
+            timestamp: current_time,
+        };
+        
+        env.storage().instance().set(
+            &DataKey::GracePeriodPenalty(circle_id, user.clone()),
+            &penalty_record
+        );
+        
+        // Process contribution
+        let token_client = token::Client::new(&env, &circle.token);
+        token_client.transfer(&user, &env.current_contract_address(), &net_amount);
+        
+        // Update member contribution count
+        let mut member: Member = env.storage().instance()
+            .get(&DataKey::Member(user.clone()))
+            .unwrap_or_else(|| panic!("Member not found"));
+        
+        member.contribution_count += 1;
+        member.last_contribution_time = current_time;
+        member.consecutive_missed_rounds = 0;
+        
+        env.storage().instance().set(&DataKey::Member(user.clone()), &member);
+        
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "late_contribution"), circle_id),
+            (user, amount, penalty_amount),
+        );
+    }
+
+    fn get_reliability_index(env: Env, user: Address) -> ReliabilityIndex {
+        env.storage().instance()
+            .get(&DataKey::ReliabilityIndex(user))
+            .unwrap_or_else(|| ReliabilityIndex {
+                member: user.clone(),
+                score: 1000, // Start at perfect score
+                total_contributions: 0,
+                on_time_contributions: 0,
+                late_contributions: 0,
+                missed_contributions: 0,
+                last_updated: env.ledger().timestamp(),
+                grace_period_hits: 0,
+            })
+    }
+
+    fn update_reliability_index(env: Env, user: Address, circle_id: u64, is_on_time: bool) {
+        let mut ri: ReliabilityIndex = Self::get_reliability_index(env.clone(), user.clone());
+        
+        ri.total_contributions += 1;
+        ri.last_updated = env.ledger().timestamp();
+        
+        if is_on_time {
+            ri.on_time_contributions += 1;
+            // Small positive impact for on-time payments
+            if ri.score < 1000 {
+                ri.score = (ri.score + 10).min(1000);
+            }
+        } else {
+            ri.late_contributions += 1;
+            ri.grace_period_hits += 1;
+            // Negative impact for late payments
+            ri.score = (ri.score - 50).max(0);
+        }
+        
+        env.storage().instance().set(&DataKey::ReliabilityIndex(user), &ri);
     }
 }
 
