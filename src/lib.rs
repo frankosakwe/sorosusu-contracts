@@ -16,14 +16,31 @@ use soroban_sdk::{
     token,
 };
 
-    // Late contribution with fee (pay after deadline but within grace period)
+    /// Submits a late contribution after the deadline but within the grace period.
+    /// A late fee is automatically deducted from the member's safety deposit.
+    ///
+    /// # Parameters
+    /// - `user`: Address making the late payment; must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    ///
+    /// # Panics
+    /// - `"Payment is not late. Use deposit function for on-time payment."` — called before deadline.
     fn late_contribution(env: Env, user: Address, circle_id: u64);
 
-    // Execute default on member (after grace period expires)
+    /// Executes a default on a member after the grace period has expired.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err(Error::DeadlineNotMissed)` (`403`) if the member has not yet missed their deadline.
+    /// - `Err(Error::GracePeriodActive)` (`404`) if the grace period has not yet expired.
     fn execute_default(env: Env, circle_id: u64, member: Address) -> Result<(), u32>;
 
-    // Issue #324: Move slashed collateral into the 72-hour pending vault.
-    // Only callable by admin. Returns Err(405) if member has no collateral to slash.
+    /// Admin-only: moves a defaulted member's collateral into the 72-hour
+    /// pending vault (appeals timelock, Issue #324).
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err(Error::NothingToSlash)` (`405`) if the member has no collateral to slash.
     fn slash_collateral(env: Env, circle_id: u64, member: Address) -> Result<(), u32>;
 
 #[contracttype]
@@ -125,10 +142,52 @@ pub enum DataKey {
     LendingMarketStats,               // Lending market statistics
 }
 
-    // NEW: Issue #287
+/// Standardized error codes for all fallible public functions.
+///
+/// Every `Result<_, u32>` return value maps to one of these variants.
+/// Use the numeric discriminant when pattern-matching on raw `u32` errors
+/// returned by the contract client.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// `401` — The requested circle does not exist, or the caller is not
+    /// authorized to perform this action.
+    Unauthorized = 401,
+    /// `403` — The member has not yet missed their deadline; default cannot
+    /// be executed yet.
+    DeadlineNotMissed = 403,
+    /// `404` — The grace period has not expired, or a voting period is still
+    /// active and cannot be finalized yet.
+    GracePeriodActive = 404,
+    /// `405` — The member has not defaulted (nothing to slash), or a vote
+    /// commitment has already been submitted for this round.
+    NothingToSlash = 405,
+    /// `406` — The 72-hour appeals timelock has not yet expired, or a vote
+    /// has already been revealed.
+    TimelockActive = 406,
+    /// `407` — Vote tally failed because the voting phase is not yet complete.
+    TallyIncomplete = 407,
+}
+
+    /// Routes a portion of the circle's reserve to an external yield pool.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `amount`: Amount in stroops to route.
+    /// - `pool_address`: Address of the yield pool contract.
+    ///
+    /// # Panics
+    /// - `"Yield routing is disabled for this circle"` — yield opt-out is active.
+    /// - `"Cannot route to yield: too close to payout"` — Time-to-Liquidity check failed.
     fn route_to_yield(env: Env, circle_id: u64, amount: u64, pool_address: Address);
 
-    // NEW: Issue #290
+    /// Withdraws previously routed funds from an external yield pool back to the circle.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `amount_to_withdraw`: Amount in stroops to withdraw.
+    /// - `pool_address`: Address of the yield pool contract.
     fn withdraw_from_yield(
         env: Env,
         circle_id: u64,
@@ -136,7 +195,15 @@ pub enum DataKey {
         pool_address: Address,
     );
 
-    // NEW: Issue #288
+    /// Accepts a contribution in any Stellar asset and auto-swaps it to the
+    /// circle's base token via Soroban path payments.
+    ///
+    /// # Parameters
+    /// - `user`: Address making the deposit; must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    /// - `source_token`: Asset the user is paying with.
+    /// - `source_amount_max`: Maximum source tokens the user is willing to spend
+    ///   (slippage guard).
     fn deposit_with_swap(
         env: Env,
         user: Address,
@@ -145,16 +212,26 @@ pub enum DataKey {
         source_amount_max: u64,
     );
 
-    // --- Yield Allocation Voting Functions ---
-
-    // Initialize voting session for yield distribution
+    /// Initializes a yield-distribution voting session for a circle.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `available_strategies`: List of strategy contract addresses members can vote on.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an error code if the session cannot be created.
     fn initialize_yield_voting(
         env: Env,
         circle_id: u64,
         available_strategies: Vec<Address>,
     ) -> Result<(), u32>;
 
-    // Cast vote for yield distribution strategy
+    /// Casts a member's vote for a yield distribution strategy.
+    ///
+    /// # Parameters
+    /// - `voter`: Address casting the vote; must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    /// - `proposed_strategies`: Ordered list of preferred distribution strategies.
     fn cast_yield_vote(
         env: Env,
         voter: Address,
@@ -162,23 +239,51 @@ pub enum DataKey {
         proposed_strategies: Vec<yield_allocation_voting::DistributionStrategy>,
     ) -> Result<(), u32>;
 
-    // Finalize voting and determine winning strategy
+    /// Finalizes the yield voting session and returns the winning strategy list.
+    ///
+    /// # Returns
+    /// `Ok(Vec<DistributionStrategy>)` — the winning ordered strategy list.
     fn finalize_yield_voting(
         env: Env,
         circle_id: u64,
     ) -> Result<Vec<yield_allocation_voting::DistributionStrategy>, u32>;
 
-    // Execute the winning distribution strategy
+    /// Executes the winning yield distribution strategy for a circle.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `total_yield_amount`: Total yield in stroops to distribute.
     fn execute_yield_distribution(
         env: Env,
         circle_id: u64,
         total_yield_amount: i128,
     ) -> Result<(), u32>;
 
-    // Finalize cycle with yield voting integration
+    /// Finalizes a yield cycle, integrating with the voting system if a session exists.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `total_yield_amount`: Total yield in stroops earned this cycle.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err(Error::GracePeriodActive)` (`404`) if the voting period is still active.
     fn finalize_cycle(env: Env, circle_id: u64, total_yield_amount: i128) -> Result<(), u32>;
 
-    // Batch harvest yield to members in chunks of 10
+    /// Distributes yield to members in paginated chunks of 10 to avoid gas limits.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `total_yield_amount`: Total yield in stroops to distribute.
+    /// - `member_addresses`: Full member address list (used for pro-rata calculation).
+    ///
+    /// # Returns
+    /// A `BatchHarvestProgress` struct tracking how many members have been processed.
+    /// Call repeatedly until `is_complete == true`.
+    ///
+    /// # Returns
+    /// - `Ok(BatchHarvestProgress)` on success.
+    /// - `Err(401)` if the circle does not exist.
     fn batch_harvest(
         env: Env,
         circle_id: u64,
@@ -242,6 +347,12 @@ pub enum DataKey {
 
     // --- Commit-reveal voting ---
 
+    /// Initializes a commit-reveal voting session for a circle.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `commit_duration`: Seconds for the commit phase.
+    /// - `reveal_duration`: Seconds for the reveal phase.
     fn initialize_voting_session(
         env: Env,
         circle_id: u64,
@@ -249,8 +360,27 @@ pub enum DataKey {
         reveal_duration: u64,
     ) -> Result<(), u32>;
 
+    /// Submits a hashed vote commitment during the commit phase.
+    ///
+    /// # Parameters
+    /// - `voter`: Address casting the vote; must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    /// - `commitment`: `SHA-256(vote_bool || salt)` as raw bytes.
+    ///
+    /// # Returns
+    /// - `Err(Error::NothingToSlash)` (`405`) if a commitment already exists.
     fn commit_vote(env: Env, voter: Address, circle_id: u64, commitment: Vec<u8>) -> Result<(), u32>;
 
+    /// Reveals a previously committed vote during the reveal phase.
+    ///
+    /// # Parameters
+    /// - `voter`: Address revealing the vote; must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    /// - `vote`: The plaintext boolean vote.
+    /// - `salt`: The salt used when hashing the commitment.
+    ///
+    /// # Returns
+    /// - `Err(Error::TimelockActive)` (`406`) if the vote has already been revealed.
     fn reveal_vote(
         env: Env,
         voter: Address,
@@ -259,12 +389,30 @@ pub enum DataKey {
         salt: Vec<u8>,
     ) -> Result<(), u32>;
 
+    /// Tallies all revealed votes and returns the result.
+    ///
+    /// # Returns
+    /// - `Ok(true)` if the vote passed, `Ok(false)` if it failed.
+    /// - `Err(Error::TallyIncomplete)` (`407`) if not all votes have been revealed.
     fn tally_votes(env: Env, circle_id: u64) -> Result<bool, u32>;
 
-    // --- Recovery helpers ---
+    /// --- Recovery helpers ---
 
+    /// Returns `true` if the circle has entered recovery state (stale/abandoned).
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle to check.
     fn check_recovery_state(env: Env, circle_id: u64) -> bool;
 
+    /// Allows a member to claim their proportional share of funds from an
+    /// abandoned circle that has entered recovery state.
+    ///
+    /// # Parameters
+    /// - `user`: Address claiming funds; must sign the transaction.
+    /// - `circle_id`: ID of the abandoned circle.
+    ///
+    /// # Panics
+    /// - `"circle is still active"` — the circle has not entered recovery state.
     fn claim_abandoned_funds(env: Env, user: Address, circle_id: u64);
 }
 
@@ -275,6 +423,16 @@ pub struct SoroSusu;
 
 #[contractimpl]
 impl SoroSusuTrait for SoroSusu {
+    /// Initializes the contract with a global administrator.
+    ///
+    /// # Parameters
+    /// - `admin`: The address that will hold admin privileges (set protocol fee,
+    ///   register anchors, purge stale groups, etc.).
+    ///
+    /// # Security
+    /// Must be called exactly once after deployment. Subsequent calls overwrite
+    /// the admin address, so the deployer should call this in the same transaction
+    /// as the contract upload.
     fn init(env: Env, admin: Address) {
         // Initialize the circle counter to 0 if it doesn't exist
         if !env.storage().instance().has(&DataKey::CircleCount) {
@@ -1235,6 +1393,24 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&DataKey::ProtocolTreasury, &treasury);
     }
 
+    /// Creates a new savings circle.
+    ///
+    /// # Parameters
+    /// - `creator`: Address of the circle creator; must sign the transaction.
+    /// - `amount`: Fixed contribution per round in stroops (1 XLM = 10 000 000 stroops).
+    /// - `max_members`: Maximum number of members allowed (determines total rounds).
+    /// - `token`: SEP-41 token contract address used for contributions and payouts.
+    /// - `cycle_duration`: Seconds between rounds (e.g. `604800` = 1 week).
+    /// - `insurance_fee_bps`: Per-member insurance premium in basis points (max 10 000).
+    /// - `nft_contract`: SBT credential contract address for badge minting.
+    ///
+    /// # Returns
+    /// The new `circle_id` (monotonically increasing `u64`).
+    ///
+    /// # Security
+    /// - `creator` must call `require_auth()` — enforced internally.
+    /// - `insurance_fee_bps` is capped at 10 000 (100 %) to prevent fee overflow.
+    /// - `cycle_duration` is capped at `MAX_CYCLE_DURATION` to prevent epoch overflow.
     fn create_circle(
         env: Env,
         creator: Address,
@@ -1305,6 +1481,19 @@ impl SoroSusuTrait for SoroSusu {
         circle_count
     }
 
+    /// Adds a member to an existing open circle.
+    ///
+    /// # Parameters
+    /// - `user`: Address joining the circle; must sign the transaction.
+    /// - `circle_id`: ID of the target circle (must be in `Open` or `Active` state).
+    /// - `shares`: Contribution multiplier — `1` (standard) or `2` (double share/payout).
+    /// - `guarantor`: Optional address that vouches for the member's contributions.
+    ///
+    /// # Panics
+    /// - `"Circle not found"` — `circle_id` does not exist.
+    /// - `"Circle is full"` — `member_count >= max_members`.
+    /// - `"Already a member"` — `user` is already in the circle.
+    /// - `"Shares must be 1 or 2"` — invalid `shares` value.
     fn join_circle(env: Env, user: Address, circle_id: u64, shares: u32, guarantor: Option<Address>) {
         // Authorization: The user MUST sign this transaction
         user.require_auth();
@@ -1359,6 +1548,19 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
 
+    /// Submits the caller's contribution for the current round.
+    ///
+    /// # Parameters
+    /// - `user`: Address making the deposit; must sign the transaction.
+    /// - `circle_id`: ID of the circle to deposit into.
+    ///
+    /// # Security
+    /// The caller must have pre-approved the SoroSusu contract to transfer
+    /// `circle.contribution_amount` tokens on their behalf (SEP-41 `approve`).
+    /// The token transfer is executed atomically within this call.
+    ///
+    /// # Panics
+    /// - `"Circle not found"` — `circle_id` does not exist.
     fn deposit(env: Env, user: Address, circle_id: u64) {
         user.require_auth();
         let circle: CircleInfo = env.storage().instance()
@@ -1385,6 +1587,18 @@ impl SoroSusuTrait for SoroSusu {
 
     // --- PAYOUT FUNCTIONS WITH GAS BUFFER ---
 
+    /// Distributes the round's pot to the current recipient.
+    ///
+    /// # Parameters
+    /// - `caller`: Address initiating the payout; must sign the transaction.
+    /// - `circle_id`: ID of the circle whose payout is being distributed.
+    ///
+    /// # Events
+    /// Emits `payout_distributed { circle_id, recipient, gross_payout }`.
+    ///
+    /// # Panics
+    /// - `"Circle not found"` — `circle_id` does not exist.
+    /// - `"No recipient set"` — no recipient is queued for this round.
     fn distribute_payout(env: Env, caller: Address, circle_id: u64) {
         caller.require_auth();
         let circle: CircleInfo = env.storage().instance()
@@ -1416,6 +1630,17 @@ impl SoroSusuTrait for SoroSusu {
     /// **DAO migration path:** Expose a time-locked `propose_trigger_payout`
     /// governance action that requires a ≥ 2/3 member vote. This removes the
     /// single point of failure while preserving the override capability.
+    /// Admin-only: forces a payout for a circle regardless of round state.
+    ///
+    /// # Parameters
+    /// - `admin`: Admin address; must sign the transaction.
+    /// - `circle_id`: ID of the circle to trigger payout for.
+    ///
+    /// # Security
+    /// Only the stored admin address may call this function.
+    ///
+    /// # Panics
+    /// - `"Unauthorized: Only admin can trigger payout"` — caller is not admin.
     fn trigger_payout(env: Env, admin: Address, circle_id: u64) {
         let stored_admin: Address = env.storage().instance()
             .get(&DataKey::Admin)
@@ -1426,6 +1651,19 @@ impl SoroSusuTrait for SoroSusu {
         Self::distribute_payout(env, admin, circle_id);
     }
 
+    /// Closes the current round and advances the payout queue to the next recipient.
+    ///
+    /// # Parameters
+    /// - `creator`: Circle creator address; must sign the transaction.
+    /// - `circle_id`: ID of the circle to finalize.
+    ///
+    /// # Events
+    /// Emits `round_finalized { circle_id, next_recipient, scheduled_time }`.
+    ///
+    /// # Panics
+    /// - `"Only creator can finalize round"` — caller is not the circle creator.
+    /// - `"Round already finalized"` — the round has already been closed.
+    /// - `"No members in circle"` — the circle has no members.
     fn finalize_round(env: Env, creator: Address, circle_id: u64) {
         creator.require_auth();
 
@@ -1474,18 +1712,45 @@ impl SoroSusuTrait for SoroSusu {
 
     // --- HELPER FUNCTIONS ---
 
+    /// Returns the full state of a circle.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle to query.
+    ///
+    /// # Returns
+    /// A `CircleInfo` struct containing all circle metadata and member list.
+    ///
+    /// # Panics
+    /// - `"Circle not found"` — `circle_id` does not exist.
     fn get_circle(env: Env, circle_id: u64) -> CircleInfo {
         env.storage().instance()
             .get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"))
     }
 
+    /// Returns the membership record for an address.
+    ///
+    /// # Parameters
+    /// - `member`: Address to look up.
+    ///
+    /// # Returns
+    /// A `Member` struct with contribution history, status, buddy, and guarantor.
+    ///
+    /// # Panics
+    /// - `"Member not found"` — `member` has never joined a circle.
     fn get_member(env: Env, member: Address) -> Member {
         env.storage().instance()
             .get(&DataKey::Member(member))
             .unwrap_or_else(|| panic!("Member not found"))
     }
 
+    /// Returns the address scheduled to receive the next payout, or `None`.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle to query.
+    ///
+    /// # Returns
+    /// `Some(Address)` if a recipient is queued, `None` if no payout is pending.
     fn get_current_recipient(env: Env, circle_id: u64) -> Option<Address> {
         let circle: CircleInfo = env.storage().instance()
             .get(&DataKey::Circle(circle_id))
@@ -1708,6 +1973,20 @@ impl SoroSusuTrait for SoroSusu {
             .unwrap_or_else(|| panic!("Deposit not found"))
     }
 
+    /// Claims the current round's payout pot for the calling user.
+    ///
+    /// # Parameters
+    /// - `user`: Address claiming the pot; must be the current round's recipient
+    ///   and must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    ///
+    /// # Security
+    /// - Enforces a flash-loan prevention guard: the user cannot withdraw and
+    ///   deposit in the same ledger.
+    /// - Reverts if a LeaseFlow default lock is active on the circle.
+    ///
+    /// # Panics
+    /// - `"Circle not found"` — `circle_id` does not exist.
     fn claim_pot(env: Env, user: Address, circle_id: u64) {
         user.require_auth();
 
@@ -1880,6 +2159,15 @@ impl SoroSusuTrait for SoroSusu {
     /// action requiring a ≥ 2/3 circle-member vote with a 24-hour challenge
     /// window. This distributes the ejection power across the group and removes
     /// the single-creator trust assumption.
+    /// Removes a member from a circle. Callable by the circle creator or admin.
+    ///
+    /// # Parameters
+    /// - `caller`: Address initiating the ejection; must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    /// - `member`: Address of the member to eject.
+    ///
+    /// # Panics
+    /// - `"Unauthorized"` — caller is neither the creator nor the admin.
     fn eject_member(env: Env, caller: Address, circle_id: u64, member: Address) {
         caller.require_auth();
         let circle: CircleInfo = env
@@ -1919,6 +2207,19 @@ impl SoroSusuTrait for SoroSusu {
     /// **DAO migration path:** Replace the admin check with a governance
     /// proposal that any token holder can submit after the 5-year threshold
     /// is verifiably exceeded.
+    /// Admin-only: archives metadata and returns residual funds to the protocol
+    /// treasury for a circle that has been dormant for ≥ 5 years.
+    ///
+    /// # Parameters
+    /// - `admin`: Admin address; must sign the transaction.
+    /// - `circle_id`: ID of the stale circle to purge.
+    ///
+    /// # Events
+    /// Emits `stale_group_purged { circle_id, admin, residual }`.
+    ///
+    /// # Panics
+    /// - `"Unauthorized: only admin can purge stale groups"` — caller is not admin.
+    /// - `"Circle is not stale: last activity was less than 5 years ago"`.
     fn purge_stale_group(env: Env, admin: Address, circle_id: u64) {
         admin.require_auth();
 
@@ -1969,6 +2270,15 @@ impl SoroSusuTrait for SoroSusu {
         );
     }
 
+    /// Assigns a social buddy to the caller for security and recovery purposes.
+    ///
+    /// # Parameters
+    /// - `user`: Address setting the buddy; must sign the transaction.
+    /// - `buddy_address`: Address of the designated buddy.
+    ///
+    /// # Security
+    /// The buddy can cover missed payments from the user's safety deposit and
+    /// participate in social recovery votes on the user's behalf.
     fn pair_with_member(env: Env, user: Address, buddy_address: Address) {
         user.require_auth();
         let user_key = DataKey::Member(user.clone());
@@ -1984,6 +2294,21 @@ impl SoroSusuTrait for SoroSusu {
 
     // Issue #324: Slash collateral — move the defaulted member's collateral into
     // the 72-hour pending vault so they have time to appeal before redistribution.
+    /// Admin-only: moves a defaulted member's collateral into the 72-hour
+    /// pending vault (appeals timelock, Issue #324).
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle containing the defaulted member.
+    /// - `member`: Address of the member whose collateral is being slashed.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err(Error::NothingToSlash)` (`405`) if the member has no collateral.
+    ///
+    /// # Security
+    /// Only the stored admin address may call this function. The slashed funds
+    /// are held in a pending vault for 72 hours to allow the member to appeal
+    /// before redistribution to victims.
     fn slash_collateral(env: Env, circle_id: u64, member: Address) -> Result<(), u32> {
         // Only admin may initiate a slash.
         let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(401u32)?;
@@ -2047,6 +2372,20 @@ impl SoroSusuTrait for SoroSusu {
 
     // Issue #324: Release pending-slash funds to the group reserve after the
     // 72-hour appeals window has elapsed.
+    /// Releases slashed collateral from the pending vault after the 72-hour
+    /// appeals timelock has expired.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `member`: Address of the member whose pending slash is being released.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err(Error::TimelockActive)` (`406`) if the 72-hour window has not yet elapsed.
+    ///
+    /// # Security
+    /// Enforces `APPEALS_TIMELOCK_SECS` (72 hours) before redistribution,
+    /// giving the member time to raise a dispute.
     fn release_pending_slash(env: Env, circle_id: u64, member: Address) -> Result<(), u32> {
         let record: PendingSlashRecord = env
             .storage()
@@ -2473,6 +2812,21 @@ impl SoroSusuTrait for SoroSusu {
         }
     }
 
+    /// Distributes yield to members in paginated chunks of 10 to avoid gas limits.
+    ///
+    /// Integer division ensures `yield_per_member = total_yield / member_count`
+    /// always rounds **down**, so the contract never attempts to send more funds
+    /// than it holds. The fractional remainder (dust) stays in the contract reserve.
+    /// Call repeatedly until `BatchHarvestProgress.is_complete == true`.
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    /// - `total_yield_amount`: Total yield in stroops to distribute pro-rata.
+    /// - `member_addresses`: Full member address list.
+    ///
+    /// # Returns
+    /// - `Ok(BatchHarvestProgress)` — progress snapshot after this chunk.
+    /// - `Err(401)` — circle not found.
     fn batch_harvest(
         env: Env,
         circle_id: u64,
@@ -2587,6 +2941,14 @@ impl SoroSusuTrait for SoroSusu {
     // Issue #274 – Group-Reputation Aggregate Score
     // -----------------------------------------------------------------------
 
+    /// Returns the aggregate reputation score for a circle (0–100).
+    ///
+    /// # Parameters
+    /// - `circle_id`: ID of the circle.
+    ///
+    /// # Returns
+    /// A `u32` score from 0 (poor) to 100 (excellent), based on on-time
+    /// payment history and member reliability indices.
     fn get_group_reputation(env: Env, circle_id: u64) -> u32 {
         // For now, return a mock calculation
         // In a full implementation, this would calculate the average RI of all group members
@@ -2722,6 +3084,16 @@ impl SoroSusuTrait for SoroSusu {
     // Issue #304 – Yield opt-out
     // -----------------------------------------------------------------------
 
+    /// Opts a member out of yield routing for a specific circle.
+    /// Opted-out members' contributions are excluded from AMM routing and
+    /// they receive no yield distributions.
+    ///
+    /// # Parameters
+    /// - `user`: Address opting out; must sign the transaction.
+    /// - `circle_id`: ID of the circle.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
     fn opt_out_of_yield(env: Env, user: Address, circle_id: u64) -> Result<(), u32> {
         user.require_auth();
         let member_key = DataKey::Member(user.clone());
@@ -2873,6 +3245,14 @@ impl SoroSusuTrait for SoroSusu {
     // Simplified-View Read-Only Wrapper
     // -----------------------------------------------------------------------
 
+    /// Returns aggregated statistics for a user across all circles.
+    /// Designed for mobile clients that need a single read call.
+    ///
+    /// # Parameters
+    /// - `user`: Address to query.
+    ///
+    /// # Returns
+    /// `Some(UserSummary)` if the user has activity, `None` otherwise.
     fn get_user_summary(env: Env, user: Address) -> Option<UserSummary> {
         // Get user's circle
         let circle_id: u64 = env.storage().instance().get(&DataKey::UserCircle(user.clone()))?;
