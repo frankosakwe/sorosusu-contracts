@@ -1,7 +1,7 @@
 use soroban_sdk::{Address, Env, Symbol, Vec, testutils::{Address as TestAddress, Logs}};
 use crate::{
     SoroSusu, SoroSusuTrait, DataKey, AnchorInfo, AnchorStatus, AnchorDeposit, 
-    DepositStatus, AnchorDepositConfig, SoulboundToken, SbtStatus, ReputationMilestone
+    DepositStatus, AnchorDepositConfig, UserBankPreference, PayoutMethod
 };
 
 #[test]
@@ -297,6 +297,309 @@ fn test_anchor_deposit_limits() {
     );
     
     assert!(result.is_err());
+}
+
+#[test]
+fn test_payout_preference_setting() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let anchor = Address::generate(&env);
+    let token = Address::generate(&env);
+    
+    // Initialize contract
+    SoroSusu::init(env.clone(), admin.clone());
+    
+    // Create circle
+    let circle_id = SoroSusu::create_circle(
+        env.clone(),
+        user.clone(),
+        100,
+        5,
+        token.clone(),
+        604800,
+        true,
+        1,
+        86400,
+        100,
+    );
+    
+    // Set up anchor config
+    let anchor_config = AnchorDepositConfig {
+        preferred_anchor: anchor.clone(),
+        bank_account_hash: 12345,
+        mobile_money_provider: Symbol::short(&env, "M-Pesa"),
+        mobile_number_hash: 67890,
+        fiat_currency: Symbol::short(&env, "KES"),
+        auto_convert: true,
+    };
+    
+    // Set payout preference to Direct-to-Bank
+    SoroSusu::set_payout_preference(
+        env.clone(),
+        user.clone(),
+        circle_id,
+        PayoutMethod::DirectToBank,
+        Some(anchor_config.clone()),
+    );
+    
+    // Verify preference was set
+    let preference = SoroSusu::get_payout_preference(env.clone(), user.clone(), circle_id);
+    assert_eq!(preference.payout_method, PayoutMethod::DirectToBank);
+    assert!(preference.anchor_config.is_some());
+    
+    let config = preference.anchor_config.unwrap();
+    assert_eq!(config.preferred_anchor, anchor);
+    assert_eq!(config.bank_account_hash, 12345);
+    assert_eq!(config.mobile_money_provider, Symbol::short(&env, "M-Pesa"));
+}
+
+#[test]
+fn test_direct_to_bank_payout() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let anchor = Address::generate(&env);
+    let token = Address::generate(&env);
+    
+    // Initialize contract
+    SoroSusu::init(env.clone(), admin.clone());
+    
+    // Register anchor
+    let mut supported_tokens = Vec::new(&env);
+    supported_tokens.push_back(token.clone());
+    
+    SoroSusu::register_anchor(
+        env.clone(),
+        admin.clone(),
+        anchor.clone(),
+        Symbol::short(&env, "TestAnchor"),
+        Symbol::short(&env, "SEP-24"),
+        false, // No KYC required for test
+        supported_tokens,
+        10000,
+        50000,
+    );
+    
+    // Create circle
+    let circle_id = SoroSusu::create_circle(
+        env.clone(),
+        user.clone(),
+        100,
+        5,
+        token.clone(),
+        604800,
+        true,
+        1,
+        86400,
+        100,
+    );
+    
+    // Join circle and make deposits
+    SoroSusu::join_circle(env.clone(), user.clone(), circle_id);
+    SoroSusu::deposit(env.clone(), user.clone(), circle_id, 100);
+    
+    // Set payout preference to Direct-to-Bank
+    let anchor_config = AnchorDepositConfig {
+        preferred_anchor: anchor.clone(),
+        bank_account_hash: 12345,
+        mobile_money_provider: Symbol::short(&env, "M-Pesa"),
+        mobile_number_hash: 67890,
+        fiat_currency: Symbol::short(&env, "KES"),
+        auto_convert: true,
+    };
+    
+    SoroSusu::set_payout_preference(
+        env.clone(),
+        user.clone(),
+        circle_id,
+        PayoutMethod::DirectToBank,
+        Some(anchor_config),
+    );
+    
+    // Process payout (this should route to anchor)
+    SoroSusu::payout(env.clone(), admin.clone(), circle_id);
+    
+    // Verify anchor deposit was created
+    // Note: In a real test, you'd check the anchor received the funds
+    // For now, we just verify the function doesn't panic
+}
+
+#[test]
+fn test_anchor_deposit_limits() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let anchor = Address::generate(&env);
+    let user = Address::generate(&env);
+    let token = Address::generate(&env);
+    
+    // Initialize contract
+    SoroSusu::init(env.clone(), admin.clone());
+    
+    // Register anchor with low limits
+    let mut supported_tokens = Vec::new(&env);
+    supported_tokens.push_back(token.clone());
+    
+    SoroSusu::register_anchor(
+        env.clone(),
+        admin.clone(),
+        anchor.clone(),
+        Symbol::short(&env, "LowLimitAnchor"),
+        Symbol::short(&env, "SEP-24"),
+        false,
+        supported_tokens,
+        500, // max_deposit_amount
+        1000, // daily_deposit_limit
+    );
+    
+    // Create circle
+    let circle_id = SoroSusu::create_circle(
+        env.clone(),
+        user.clone(),
+        100,
+        5,
+        token.clone(),
+        604800,
+        true,
+        1,
+        86400,
+        100,
+    );
+    
+    SoroSusu::join_circle(env.clone(), user.clone(), circle_id);
+    
+    // Try to deposit more than max limit - should fail
+    let result = env.try_invoke_contract::<SoroSusuTrait>(
+        &env.current_contract_address(),
+        &SoroSusuTrait::deposit_for_user,
+        (
+            anchor.clone(),
+            user.clone(),
+            circle_id,
+            1000, // amount exceeding max_deposit_amount
+            token.clone(),
+            Symbol::short(&env, "TEST_REF"),
+        ),
+    );
+    
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_kyc_verification_required() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let anchor = Address::generate(&env);
+    let user = Address::generate(&env);
+    let token = Address::generate(&env);
+    
+    // Initialize contract
+    SoroSusu::init(env.clone(), admin.clone());
+    
+    // Register anchor with KYC requirement
+    let mut supported_tokens = Vec::new(&env);
+    supported_tokens.push_back(token.clone());
+    
+    SoroSusu::register_anchor(
+        env.clone(),
+        admin.clone(),
+        anchor.clone(),
+        Symbol::short(&env, "KYCAnchor"),
+        Symbol::short(&env, "SEP-24"),
+        true, // KYC required
+        supported_tokens,
+        10000,
+        50000,
+    );
+    
+    // Create circle
+    let circle_id = SoroSusu::create_circle(
+        env.clone(),
+        user.clone(),
+        100,
+        5,
+        token.clone(),
+        604800,
+        true,
+        1,
+        86400,
+        100,
+    );
+    
+    SoroSusu::join_circle(env.clone(), user.clone(), circle_id);
+    
+    // Try to deposit without KYC - should fail
+    let result = env.try_invoke_contract::<SoroSusuTrait>(
+        &env.current_contract_address(),
+        &SoroSusuTrait::deposit_for_user,
+        (
+            anchor.clone(),
+            user.clone(),
+            circle_id,
+            100,
+            token.clone(),
+            Symbol::short(&env, "TEST_REF"),
+        ),
+    );
+    
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_fallback_to_direct_token_payout() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let token = Address::generate(&env);
+    
+    // Initialize contract
+    SoroSusu::init(env.clone(), admin.clone());
+    
+    // Create circle
+    let circle_id = SoroSusu::create_circle(
+        env.clone(),
+        user.clone(),
+        100,
+        5,
+        token.clone(),
+        604800,
+        true,
+        1,
+        86400,
+        100,
+    );
+    
+    // Join circle and make deposits
+    SoroSusu::join_circle(env.clone(), user.clone(), circle_id);
+    SoroSusu::deposit(env.clone(), user.clone(), circle_id, 100);
+    
+    // Set payout preference to Direct-to-Bank but without anchor config
+    // This should fallback to direct token payout
+    SoroSusu::set_payout_preference(
+        env.clone(),
+        user.clone(),
+        circle_id,
+        PayoutMethod::DirectToBank,
+        None, // No anchor config
+    );
+    
+    // Process payout (should fallback to direct token)
+    SoroSusu::payout(env.clone(), admin.clone(), circle_id);
+    
+    // Verify preference is still Direct-to-Bank but payout worked
+    let preference = SoroSusu::get_payout_preference(env.clone(), user.clone(), circle_id);
+    assert_eq!(preference.payout_method, PayoutMethod::DirectToBank);
+    assert!(preference.anchor_config.is_none());
 }
 
 #[test]

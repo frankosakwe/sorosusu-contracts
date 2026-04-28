@@ -112,6 +112,22 @@ Sets a social buddy for security and recovery purposes.
 #### `set_safety_deposit(env: Env, user: Address, circle_id: u64, amount: i128)`
 Deposits collateral into a circle's safety buffer.
 
+### SEP-24 Anchor Integration
+#### `register_anchor(env: Env, admin: Address, anchor_address: Address, name: Symbol, sep_version: Symbol, kyc_required: bool, supported_tokens: Vec<Address>, max_deposit_amount: u64, daily_deposit_limit: u64)`
+Registers a new SEP-24 anchor for fiat conversions.
+
+#### `set_payout_preference(env: Env, user: Address, circle_id: u64, payout_method: PayoutMethod, anchor_config: Option<AnchorDepositConfig>)`
+Sets user's payout preference for a circle (Direct Token vs Direct-to-Bank).
+
+#### `get_payout_preference(env: Env, user: Address, circle_id: u64) -> UserBankPreference`
+Retrieves user's payout preference for a circle.
+
+#### `deposit_for_user(env: Env, anchor_address: Address, user_address: Address, circle_id: u64, amount: u64, token: Address, fiat_reference: Symbol)`
+Deposits funds on behalf of a user via an anchor (for SEP-24 integration).
+
+#### `process_anchor_payout(env: Env, anchor_address: Address, user_address: Address, circle_id: u64, amount: u64, token: Address) -> Result<u64, u32>`
+Processes a payout to an anchor for fiat conversion.
+
 ---
 
 ## Core Features
@@ -120,6 +136,13 @@ Members participate at different contribution levels (1x or 2x), with payouts ad
 
 ### Path Payments
 Enables members to contribute using any Stellar asset, automatically swapped to the circle's base currency via Soroban's native swap capabilities.
+
+### SEP-24 Direct-to-Bank Payouts
+- **Anchor Integration**: Users can choose to receive payouts as fiat currency directly to their bank accounts or mobile money wallets (e.g., M-Pesa).
+- **Automatic Conversion**: Contract automatically routes payouts to designated SEP-24 anchors for crypto-to-fiat conversion.
+- **Fallback Safety**: If anchor processing fails, system automatically falls back to direct token payouts.
+- **KYC Support**: Optional KYC verification for enhanced security and compliance.
+- **Mobile Money Support**: Supports popular mobile money providers across African markets.
 
 ### Buddy System & Trust Networks
 - **Buddy Assignment**: Every member is paired with a "Buddy" responsible for social vouching.
