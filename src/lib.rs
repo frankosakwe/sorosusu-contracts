@@ -134,7 +134,8 @@ pub struct GasBufferConfig {
 pub enum DataKey {
     Admin,
     Circle(u64),
-    Member(Address),
+    Member(Address), // DEPRECATED: Use Members(u64) instead for new circles
+    Members(u64), // NEW: Vec-based member storage per circle
     CircleMember(u64, u32),
     CircleCount,
     ScheduledPayoutTime(u64),
@@ -888,6 +889,33 @@ pub struct CollateralInfo {
 #[contracttype]
 #[derive(Clone)]
 pub struct Member {
+    pub address: Address,
+    pub index: u32,
+    pub contribution_count: u32,
+    pub last_contribution_time: u64,
+    pub status: MemberStatus,
+    pub tier_multiplier: u32,
+    pub consecutive_missed_rounds: u32,
+    pub referrer: Option<Address>,
+    pub buddy: Option<Address>,
+    pub shares: u32,
+    pub guarantor: Option<Address>,
+}
+
+/// Maximum group size for Vec-based storage optimization.
+/// ROSCA groups are typically 5-20 members. Vec storage is more efficient than
+/// Map storage for small groups due to:
+/// - Single ledger entry vs n separate entries (lower storage rent)
+/// - O(n) iteration faster than O(log n) lookup for n ≤ 20 (lower constant overhead)
+/// - Batch operations (count_active_members) require 1 read instead of n reads
+pub const MAX_GROUP_SIZE: u32 = 20;
+
+/// New Vec-based member storage structure for small group optimization.
+/// Replaces individual DataKey::Member(Address) entries with a single
+/// DataKey::Members(circle_id) Vec to reduce storage costs.
+#[contracttype]
+#[derive(Clone)]
+pub struct MemberRecord {
     pub address: Address,
     pub index: u32,
     pub contribution_count: u32,
@@ -1669,6 +1697,42 @@ fn get_member_address_by_index(circle: &CircleInfo, index: u32) -> Address {
     circle.member_addresses.get(index).unwrap()
 }
 
+/// Helper function to find a member's index in the Vec by address.
+/// Returns None if the member is not found.
+/// 
+/// This is O(n) but acceptable for small groups (n ≤ 20) where the constant
+/// overhead of Vec iteration is lower than Map lookup on Soroban.
+fn find_member(members: &Vec<MemberRecord>, addr: &Address) -> Option<u32> {
+    members.iter().position(|m| &m.address == addr).map(|i| i as u32)
+}
+
+/// Helper function to get a mutable reference to a member by address.
+/// Returns None if the member is not found.
+fn get_member_mut<'a>(members: &'a mut Vec<MemberRecord>, addr: &Address) -> Option<&'a mut MemberRecord> {
+    members.iter_mut().find(|m| &m.address == addr)
+}
+
+/// Helper function to get an immutable reference to a member by address.
+/// Returns None if the member is not found.
+fn get_member_ref<'a>(members: &'a Vec<MemberRecord>, addr: &Address) -> Option<&'a MemberRecord> {
+    members.iter().find(|m| &m.address == addr)
+}
+
+/// Load the members Vec for a circle. Returns empty Vec if not found.
+fn load_members(env: &Env, circle_id: u64) -> Vec<MemberRecord> {
+    env.storage()
+        .instance()
+        .get(&DataKey::Members(circle_id))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Save the members Vec for a circle.
+fn save_members(env: &Env, circle_id: u64, members: &Vec<MemberRecord>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::Members(circle_id), members);
+}
+
 fn execute_stellar_path_payment(env: &Env, source_token: &Address, target_token: &Address, source_amount: i128, max_slippage_bps: u32) -> (i128, i128, u32) {
     // This is a simplified implementation - in production would call actual Stellar Path Payment
     // For now, we'll simulate the swap with a basic exchange rate
@@ -1708,17 +1772,11 @@ fn execute_stellar_path_payment(env: &Env, source_token: &Address, target_token:
 }
 
 fn count_active_members(env: &Env, circle: &CircleInfo) -> u32 {
-    let mut active_count = 0u32;
-    for i in 0..circle.member_count {
-        let member_address = circle.member_addresses.get(i).unwrap();
-        let key = DataKey::Member(member_address);
-        if let Some(member) = env.storage().instance().get::<DataKey, Member>(&key) {
-            if member.status == MemberStatus::Active {
-                active_count += 1;
-            }
-        }
-    }
-    active_count
+    // Load members Vec (single storage read instead of n reads)
+    let members = load_members(env, circle.id);
+    
+    // Count active members with O(n) iteration (acceptable for n ≤ 20)
+    members.iter().filter(|m| m.status == MemberStatus::Active).count() as u32
 }
 
 fn apply_recovery_if_consensus(env: &Env, actor: &Address, circle_id: u64, circle: &mut CircleInfo) {
@@ -1741,45 +1799,51 @@ fn apply_recovery_if_consensus(env: &Env, actor: &Address, circle_id: u64, circl
         .clone()
         .unwrap_or_else(|| panic!("No recovery proposal"));
 
-        let old_member_key = DataKey::Member(old_address.clone());
-    let mut old_member: Member = env
-        .storage()
-        .instance()
-        .get(&old_member_key)
+    // Load members Vec
+    let mut members = load_members(env, circle_id);
+    
+    // Find old member in Vec
+    let old_member_idx = find_member(&members, &old_address)
         .unwrap_or_else(|| panic!("Old member not found"));
-
+    
+    let old_member = members.get(old_member_idx).unwrap();
+    
     if old_member.status != MemberStatus::Active {
         panic!("Only active members can be recovered");
     }
 
-    let new_member_key = DataKey::Member(new_address.clone());
-    if env.storage().instance().has(&new_member_key) {
+    // Check new address is not already a member
+    if find_member(&members, &new_address).is_some() {
         panic!("New address is already a member");
     }
 
-    old_member.address = new_address.clone();
-    env.storage().instance().set(&new_member_key, &old_member);
-    env.storage().instance().remove(&old_member_key);
+    // Update member address in Vec
+    let mut updated_member = old_member.clone();
+    updated_member.address = new_address.clone();
+    members.set(old_member_idx, updated_member);
+    
+    // Save updated members Vec
+    save_members(env, circle_id, &members);
 
-        // Migrate UserStats
-        if let Some(stats) = env.storage().instance().get::<DataKey, UserStats>(&DataKey::UserStats(old_address.clone())) {
-            env.storage().instance().set(&DataKey::UserStats(new_address.clone()), &stats);
-            env.storage().instance().remove(&DataKey::UserStats(old_address.clone()));
-        }
+    // Migrate UserStats
+    if let Some(stats) = env.storage().instance().get::<DataKey, UserStats>(&DataKey::UserStats(old_address.clone())) {
+        env.storage().instance().set(&DataKey::UserStats(new_address.clone()), &stats);
+        env.storage().instance().remove(&DataKey::UserStats(old_address.clone()));
+    }
 
-        // Migrate SocialCapital
-        if let Some(sc) = env.storage().instance().get::<DataKey, SocialCapital>(&DataKey::SocialCapital(old_address.clone(), circle_id)) {
-            let mut new_sc = sc.clone();
-            new_sc.member = new_address.clone();
-            env.storage().instance().set(&DataKey::SocialCapital(new_address.clone(), circle_id), &new_sc);
-            env.storage().instance().remove(&DataKey::SocialCapital(old_address.clone(), circle_id));
-        }
+    // Migrate SocialCapital
+    if let Some(sc) = env.storage().instance().get::<DataKey, SocialCapital>(&DataKey::SocialCapital(old_address.clone(), circle_id)) {
+        let mut new_sc = sc.clone();
+        new_sc.member = new_address.clone();
+        env.storage().instance().set(&DataKey::SocialCapital(new_address.clone(), circle_id), &new_sc);
+        env.storage().instance().remove(&DataKey::SocialCapital(old_address.clone(), circle_id));
+    }
 
-        // Migrate SafetyDeposit
-        if let Some(sd) = env.storage().instance().get::<DataKey, i128>(&DataKey::SafetyDeposit(old_address.clone(), circle_id)) {
-            env.storage().instance().set(&DataKey::SafetyDeposit(new_address.clone(), circle_id), &sd);
-            env.storage().instance().remove(&DataKey::SafetyDeposit(old_address.clone(), circle_id));
-        }
+    // Migrate SafetyDeposit
+    if let Some(sd) = env.storage().instance().get::<DataKey, i128>(&DataKey::SafetyDeposit(old_address.clone(), circle_id)) {
+        env.storage().instance().set(&DataKey::SafetyDeposit(new_address.clone(), circle_id), &sd);
+        env.storage().instance().remove(&DataKey::SafetyDeposit(old_address.clone(), circle_id));
+    }
 
     circle
         .member_addresses
@@ -2098,6 +2162,7 @@ impl SoroSusuTrait for SoroSusu {
     /// # Panics
     /// - `"Circle not found"` — `circle_id` does not exist.
     /// - `"Circle is full"` — `member_count >= max_members`.
+    /// - `"Group size limit exceeded"` — attempting to exceed MAX_GROUP_SIZE.
     /// - `"Already a member"` — `user` is already in the circle.
     /// - `"Shares must be 1 or 2"` — invalid `shares` value.
     fn join_circle(env: Env, user: Address, circle_id: u64, shares: u32, guarantor: Option<Address>) {
@@ -2119,21 +2184,29 @@ impl SoroSusuTrait for SoroSusu {
             panic!("Circle is full");
         }
 
-        // Check if the user is already a member
-        if circle.member_addresses.contains(&user) {
+        // Enforce MAX_GROUP_SIZE for Vec-based storage optimization
+        if circle.member_count >= MAX_GROUP_SIZE {
+            panic!("Group size limit exceeded");
+        }
+
+        // Load existing members Vec
+        let mut members = load_members(&env, circle_id);
+
+        // Check if the user is already a member (O(n) scan acceptable for n ≤ 20)
+        if find_member(&members, &user).is_some() {
             panic!("Already a member");
         }
 
-        // Add the user to the members list
+        // Add the user to the members list in CircleInfo (for backward compatibility)
         circle.member_addresses.push_back(user.clone());
         circle.member_count += 1;
 
-        // Store member by index for efficient lookup during payouts
+        // Store member by index for efficient lookup during payouts (legacy)
         let member_index = circle.member_count - 1;
         env.storage().instance().set(&DataKey::CircleMember(circle_id, member_index), &user);
 
-        // Create member record
-        let member = Member {
+        // Create member record and add to Vec
+        let member = MemberRecord {
             address: user.clone(),
             index: member_index,
             contribution_count: 0,
@@ -2147,8 +2220,11 @@ impl SoroSusuTrait for SoroSusu {
             guarantor,
         };
 
-        // Store the member
-        env.storage().instance().set(&DataKey::Member(user.clone()), &member);
+        // Add to members Vec
+        members.push_back(member);
+
+        // Save the members Vec (single storage write)
+        save_members(&env, circle_id, &members);
 
         // Update the circle
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
@@ -2168,6 +2244,7 @@ impl SoroSusuTrait for SoroSusu {
     ///
     /// # Panics
     /// - `"Circle not found"` — `circle_id` does not exist.
+    /// - `"Member not found"` — `user` is not a member of the circle.
     fn deposit(env: Env, user: Address, circle_id: u64, rounds: u32) {
         user.require_auth();
         if rounds == 0 {
@@ -2178,9 +2255,11 @@ impl SoroSusuTrait for SoroSusu {
             .get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"));
 
-        let member_key = DataKey::Member(user.clone());
-        let mut member: Member = env.storage().instance()
-            .get(&member_key)
+        // Load members Vec
+        let mut members = load_members(&env, circle_id);
+
+        // Find and update member (O(n) scan acceptable for n ≤ 20)
+        let member = get_member_mut(&mut members, &user)
             .unwrap_or_else(|| panic!("Member not found"));
 
         if member.status != MemberStatus::Active {
@@ -2206,7 +2285,8 @@ impl SoroSusuTrait for SoroSusu {
             .unwrap_or_else(|| panic!("Member index overflow"));
         circle.contribution_bitmap |= contribution_bit;
 
-        env.storage().instance().set(&member_key, &member);
+        // Save updated members Vec (single storage write)
+        save_members(&env, circle_id, &members);
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
         env.storage().instance().set(&DataKey::Deposit(circle_id, user), &true);
     }
@@ -2380,9 +2460,39 @@ impl SoroSusuTrait for SoroSusu {
     /// # Panics
     /// - `"Member not found"` — `member` has never joined a circle.
     fn get_member(env: Env, member: Address) -> Member {
-        env.storage().instance()
-            .get(&DataKey::Member(member))
-            .unwrap_or_else(|| panic!("Member not found"))
+        // Try to find member across all circles by checking Members Vec
+        // For backward compatibility, also check legacy DataKey::Member storage
+        
+        // First try legacy storage
+        if let Some(legacy_member) = env.storage().instance().get::<DataKey, Member>(&DataKey::Member(member.clone())) {
+            return legacy_member;
+        }
+
+        // Search through all circles (this is inefficient but maintains backward compatibility)
+        // In production, callers should use get_circle_member(circle_id, member) instead
+        let circle_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
+        
+        for circle_id in 1..=circle_count {
+            let members = load_members(&env, circle_id);
+            if let Some(member_record) = get_member_ref(&members, &member) {
+                // Convert MemberRecord to Member for backward compatibility
+                return Member {
+                    address: member_record.address.clone(),
+                    index: member_record.index,
+                    contribution_count: member_record.contribution_count,
+                    last_contribution_time: member_record.last_contribution_time,
+                    status: member_record.status.clone(),
+                    tier_multiplier: member_record.tier_multiplier,
+                    consecutive_missed_rounds: member_record.consecutive_missed_rounds,
+                    referrer: member_record.referrer.clone(),
+                    buddy: member_record.buddy.clone(),
+                    shares: member_record.shares,
+                    guarantor: member_record.guarantor.clone(),
+                };
+            }
+        }
+        
+        panic!("Member not found")
     }
 
     /// Returns the address scheduled to receive the next payout, or `None`.
