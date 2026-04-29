@@ -82,6 +82,12 @@ pub enum DataKey {
     TaxReport(u64), // CircleID -> TaxReport
     TaxWithholdingPool, // Pool for collected tax funds
     JurisdictionExemption(Address), // UserAddress -> bool (exempt from interest withholding)
+    // Heartbeat mechanism storage keys
+    AdminHeartbeat(u64), // Last heartbeat timestamp per circle
+    LeadershipCrisis(u64), // Leadership crisis state per circle
+    LeadershipClaim(u64), // Leadership claim records per circle
+    LeadershipChallenge(u64), // Challenge window records per circle
+    OrphanedCircleRefund(u64), // Refund eligibility for orphaned circles
 }
 
 pub use liquidity_buffer::*;
@@ -96,6 +102,9 @@ mod reputation_export_tests;
 
 #[cfg(test)]
 mod tax_withholding_tests;
+
+#[cfg(test)]
+mod heartbeat_tests;
 
 /// 72 hours in seconds — the mandatory appeals window before slashed collateral
 /// can be redistributed to victims (Issue #324).
@@ -1023,6 +1032,94 @@ pub struct CircleInfo {
     /// Multi-asset basket: None for single-token circles, Some(...) for basket circles.
     /// Each AssetWeight specifies a token address and its allocation in basis points.
     pub basket: Option<Vec<AssetWeight>>,
+    /// Heartbeat mechanism fields
+    pub last_heartbeat: Option<u64>, // Last heartbeat timestamp from admin
+    pub is_in_crisis: bool, // Whether circle is in leadership crisis
+    pub crisis_started_at: Option<u64>, // When crisis began
+    pub leadership_claimant: Option<Address>, // Current leadership claimant
+    pub claim_deadline: Option<u64>, // Deadline for challenge window
+    pub orphaned_at: Option<u64>, // When circle became permanently orphaned
+}
+
+// --- HEARTBEAT MECHANISM DATA STRUCTURES ---
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum LeadershipCrisisStatus {
+    Normal,           // Admin is active
+    InCrisis,         // Leadership crisis declared
+    ChallengeActive,  // Leadership claim being challenged
+    Transferred,      // Leadership successfully transferred
+    Orphaned,         // Circle permanently orphaned
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LeadershipClaim {
+    pub claimant: Address,
+    pub claimed_at: u64,
+    pub challenge_deadline: u64,
+    pub reliability_index: u32,
+    pub is_challenged: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct HeartbeatConfig {
+    pub heartbeat_interval_secs: u64,     // 90 days in seconds
+    pub challenge_window_secs: u64,       // 48 hours in seconds
+    pub orphan_threshold_secs: u64,       // 180 days in seconds
+    pub min_reliability_index: u32,       // 800 RI threshold
+}
+
+// Default heartbeat configuration
+pub const HEARTBEAT_INTERVAL: u64 = 90 * 24 * 60 * 60;     // 90 days
+pub const CHALLENGE_WINDOW: u64 = 48 * 60 * 60;            // 48 hours
+pub const ORPHAN_THRESHOLD: u64 = 180 * 24 * 60 * 60;     // 180 days
+pub const MIN_RI_FOR_LEADERSHIP: u32 = 800;
+
+// --- HEARTBEAT EVENTS ---
+
+#[contracttype]
+#[derive(Debug)]
+pub enum HeartbeatEvent {
+    AdminHeartbeatReceived {
+        circle_id: u64,
+        admin: Address,
+        timestamp: u64,
+    },
+    AdminHeartbeatLost {
+        circle_id: u64,
+        last_heartbeat: u64,
+        crisis_started: u64,
+    },
+    LeadershipClaimed {
+        circle_id: u64,
+        claimant: Address,
+        reliability_index: u32,
+        challenge_deadline: u64,
+    },
+    LeadershipChallengeReset {
+        circle_id: u64,
+        claimant: Address,
+        reset_by: Address,
+    },
+    LeadershipTransferred {
+        circle_id: u64,
+        old_admin: Address,
+        new_admin: Address,
+        transferred_at: u64,
+    },
+    CircleOrphaned {
+        circle_id: u64,
+        last_admin: Option<Address>,
+        orphaned_at: u64,
+    },
+    RefundTriggered {
+        circle_id: u64,
+        refund_triggered_at: u64,
+        total_refund_amount: i128,
+    },
 }
 
 // --- ISSUE #406: ANTI-COLLUSION MULTI-SIG FOR ROUND SKIPPING ---
@@ -2120,6 +2217,40 @@ pub trait SoroSusuTrait {
     ) -> Result<(), u32>;
     fn get_shielded_balance(env: Env) -> i128;
     fn is_nullifier_spent(env: Env, nullifier: BytesN<32>) -> bool;
+
+    // --- HEARTBEAT MECHANISM ---
+    
+    /// Admin heartbeat function - must be called at least once every 90 days
+    fn heartbeat(env: Env, admin: Address, circle_id: u64);
+    
+    /// Claim leadership when admin heartbeat is missed (RI > 800 required)
+    fn claim_leadership(env: Env, claimant: Address, circle_id: u64) -> Result<(), u32>;
+    
+    /// Reset a leadership claim (original admin or any member can call during challenge window)
+    fn reset_leadership_claim(env: Env, caller: Address, circle_id: u64) -> Result<(), u32>;
+    
+    /// Check if circle is in leadership crisis and trigger automatic refunds
+    fn check_orphaned_circle(env: Env, circle_id: u64) -> Result<(), u32>;
+    
+    /// Get heartbeat status for a circle
+    fn get_heartbeat_status(env: Env, circle_id: u64) -> HeartbeatStatus;
+}
+
+// --- HEARTBEAT STATUS STRUCT ---
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct HeartbeatStatus {
+    pub circle_id: u64,
+    pub last_heartbeat: Option<u64>,
+    pub is_in_crisis: bool,
+    pub crisis_started_at: Option<u64>,
+    pub leadership_claimant: Option<Address>,
+    pub claim_deadline: Option<u64>,
+    pub is_orphaned: bool,
+    pub orphaned_at: Option<u64>,
+    pub time_until_heartbeat: Option<u64>, // Seconds until next heartbeat required
+    pub time_until_orphaned: Option<u64>, // Seconds until circle becomes orphaned
 }
 
 // --- IMPLEMENTATION ---
@@ -2583,6 +2714,13 @@ fn create_circle(
             recovery_votes_bitmap: 0,
             arbitrator: creator.clone(),
             basket: None,
+            // Heartbeat mechanism fields
+            last_heartbeat: Some(env.ledger().timestamp()), // Initialize with creation time
+            is_in_crisis: false,
+            crisis_started_at: None,
+            leadership_claimant: None,
+            claim_deadline: None,
+            orphaned_at: None,
         };
 
         // Store the circle
@@ -2698,6 +2836,9 @@ fn create_circle(
         if rounds == 0 {
             panic!("Rounds must be greater than zero");
         }
+
+        // Check for leadership crisis before processing deposit
+        check_leadership_crisis(&env, circle_id);
 
         let circle: CircleInfo = env.storage().instance()
             .get(&DataKey::Circle(circle_id))
@@ -7680,6 +7821,394 @@ mod fuzz_tests {
     fn is_nullifier_spent(env: Env, nullifier: BytesN<32>) -> bool {
         zk_privacy::ZkVerifierTrait::is_nullifier_spent(env, nullifier)
     }
+
+    // --- HEARTBEAT MECHANISM IMPLEMENTATIONS ---
+
+    /// Admin heartbeat function - must be called at least once every 90 days
+    fn heartbeat(env: Env, admin: Address, circle_id: u64) {
+        admin.require_auth();
+        
+        let current_time = env.ledger().timestamp();
+        let circle_key = DataKey::Circle(circle_id);
+        let mut circle: CircleInfo = env.storage().instance().get(&circle_key)
+            .expect("Circle not found");
+        
+        // Verify caller is the circle creator (admin)
+        if circle.creator != admin {
+            panic!("Only circle creator can send heartbeat");
+        }
+        
+        // Update heartbeat timestamp
+        circle.last_heartbeat = Some(current_time);
+        
+        // Reset crisis state if it was active
+        if circle.is_in_crisis {
+            circle.is_in_crisis = false;
+            circle.crisis_started_at = None;
+            circle.leadership_claimant = None;
+            circle.claim_deadline = None;
+        }
+        
+        // Update circle in storage
+        env.storage().instance().set(&circle_key, &circle);
+        
+        // Store heartbeat timestamp separately for easy access
+        env.storage().instance().set(&DataKey::AdminHeartbeat(circle_id), &current_time);
+        
+        // Emit heartbeat event
+        env.events().publish(
+            symbol_short!("HEARTBEAT"),
+            HeartbeatEvent::AdminHeartbeatReceived {
+                circle_id,
+                admin,
+                timestamp: current_time,
+            },
+        );
+    }
+
+    /// Claim leadership when admin heartbeat is missed (RI > 800 required)
+    fn claim_leadership(env: Env, claimant: Address, circle_id: u64) -> Result<(), u32> {
+        let current_time = env.ledger().timestamp();
+        let circle_key = DataKey::Circle(circle_id);
+        let mut circle: CircleInfo = env.storage().instance().get(&circle_key)
+            .expect("Circle not found");
+        
+        // Check if circle is already in crisis
+        if !circle.is_in_crisis {
+            return Err(501); // Not in crisis
+        }
+        
+        // Check if there's already a claimant
+        if circle.leadership_claimant.is_some() {
+            return Err(502); // Leadership already claimed
+        }
+        
+        // Get claimant's reliability index
+        let ri_key = DataKey::ReliabilityIndex(claimant.clone());
+        let claimant_ri: u32 = env.storage().instance().get(&ri_key)
+            .unwrap_or(0);
+        
+        // Check RI threshold (800)
+        if claimant_ri < MIN_RI_FOR_LEADERSHIP {
+            return Err(503); // Reliability index too low
+        }
+        
+        // Verify claimant is a member of the circle
+        let members_key = DataKey::Members(circle_id);
+        let members: Vec<Address> = env.storage().instance().get(&members_key)
+            .unwrap_or(Vec::new(&env));
+        
+        if !members.contains(&claimant) {
+            return Err(504); // Not a circle member
+        }
+        
+        // Set leadership claim
+        circle.leadership_claimant = Some(claimant.clone());
+        circle.claim_deadline = Some(current_time + CHALLENGE_WINDOW);
+        
+        // Update circle in storage
+        env.storage().instance().set(&circle_key, &circle);
+        
+        // Store leadership claim record
+        let claim = LeadershipClaim {
+            claimant: claimant.clone(),
+            claimed_at: current_time,
+            challenge_deadline: current_time + CHALLENGE_WINDOW,
+            reliability_index: claimant_ri,
+            is_challenged: false,
+        };
+        env.storage().instance().set(&DataKey::LeadershipClaim(circle_id), &claim);
+        
+        // Emit leadership claim event
+        env.events().publish(
+            symbol_short!("LEADERSHIP"),
+            HeartbeatEvent::LeadershipClaimed {
+                circle_id,
+                claimant,
+                reliability_index: claimant_ri,
+                challenge_deadline: current_time + CHALLENGE_WINDOW,
+            },
+        );
+        
+        Ok(())
+    }
+
+    /// Reset a leadership claim (original admin or any member can call during challenge window)
+    fn reset_leadership_claim(env: Env, caller: Address, circle_id: u64) -> Result<(), u32> {
+        let current_time = env.ledger().timestamp();
+        let circle_key = DataKey::Circle(circle_id);
+        let mut circle: CircleInfo = env.storage().instance().get(&circle_key)
+            .expect("Circle not found");
+        
+        // Check if there's an active claim
+        let claimant = match circle.leadership_claimant {
+            Some(addr) => addr,
+            None => return Err(505), // No active claim
+        };
+        
+        // Check if challenge window is still active
+        let deadline = circle.claim_deadline.unwrap_or(0);
+        if current_time > deadline {
+            return Err(506); // Challenge window expired
+        }
+        
+        // Verify caller is either original admin or a circle member
+        let is_admin = circle.creator == caller;
+        let members_key = DataKey::Members(circle_id);
+        let members: Vec<Address> = env.storage().instance().get(&members_key)
+            .unwrap_or(Vec::new(&env));
+        let is_member = members.contains(&caller);
+        
+        if !is_admin && !is_member {
+            return Err(507); // Not authorized to reset
+        }
+        
+        // Reset leadership claim
+        circle.leadership_claimant = None;
+        circle.claim_deadline = None;
+        
+        // Update circle in storage
+        env.storage().instance().set(&circle_key, &circle);
+        
+        // Remove leadership claim record
+        env.storage().instance().remove(&DataKey::LeadershipClaim(circle_id));
+        
+        // Emit reset event
+        env.events().publish(
+            symbol_short!("LEADERSHIP"),
+            HeartbeatEvent::LeadershipChallengeReset {
+                circle_id,
+                claimant,
+                reset_by: caller,
+            },
+        );
+        
+        Ok(())
+    }
+
+    /// Check if circle is in leadership crisis and trigger automatic refunds
+    fn check_orphaned_circle(env: Env, circle_id: u64) -> Result<(), u32> {
+        let current_time = env.ledger().timestamp();
+        let circle_key = DataKey::Circle(circle_id);
+        let mut circle: CircleInfo = env.storage().instance().get(&circle_key)
+            .expect("Circle not found");
+        
+        // Check if circle is already marked as orphaned
+        if circle.orphaned_at.is_some() {
+            return Err(508); // Already orphaned
+        }
+        
+        // Check if circle has been in crisis for more than 180 days
+        let crisis_started = circle.crisis_started_at.unwrap_or(0);
+        if crisis_started == 0 {
+            return Err(509); // Not in crisis
+        }
+        
+        if current_time - crisis_started < ORPHAN_THRESHOLD {
+            return Err(510); // Not yet orphaned
+        }
+        
+        // Mark circle as orphaned
+        circle.orphaned_at = Some(current_time);
+        circle.is_in_crisis = false; // End crisis state
+        circle.leadership_claimant = None;
+        circle.claim_deadline = None;
+        
+        // Update circle in storage
+        env.storage().instance().set(&circle_key, &circle);
+        
+        // Store orphaned record
+        env.storage().instance().set(&DataKey::OrphanedCircleRefund(circle_id), &current_time);
+        
+        // Calculate total refund amount (sum of all contributions)
+        let members_key = DataKey::Members(circle_id);
+        let members: Vec<Address> = env.storage().instance().get(&members_key)
+            .unwrap_or(Vec::new(&env));
+        
+        let mut total_refund = 0i128;
+        for member in members.iter() {
+            let deposit_key = DataKey::Deposit(circle_id, member.clone());
+            if let Some(amount) = env.storage().instance().get::<i128>(&deposit_key) {
+                total_refund += amount;
+            }
+        }
+        
+        // Emit orphaned circle event
+        env.events().publish(
+            symbol_short!("ORPHANED"),
+            HeartbeatEvent::CircleOrphaned {
+                circle_id,
+                last_admin: Some(circle.creator),
+                orphaned_at: current_time,
+            },
+        );
+        
+        // Emit refund triggered event
+        env.events().publish(
+            symbol_short!("REFUND"),
+            HeartbeatEvent::RefundTriggered {
+                circle_id,
+                refund_triggered_at: current_time,
+                total_refund_amount: total_refund,
+            },
+        );
+        
+        Ok(())
+    }
+
+    /// Get heartbeat status for a circle
+    fn get_heartbeat_status(env: Env, circle_id: u64) -> HeartbeatStatus {
+        let current_time = env.ledger().timestamp();
+        let circle_key = DataKey::Circle(circle_id);
+        let circle: CircleInfo = env.storage().instance().get(&circle_key)
+            .expect("Circle not found");
+        
+        let last_heartbeat = circle.last_heartbeat;
+        let is_in_crisis = circle.is_in_crisis;
+        let crisis_started_at = circle.crisis_started_at;
+        let leadership_claimant = circle.leadership_claimant;
+        let claim_deadline = circle.claim_deadline;
+        let orphaned_at = circle.orphaned_at;
+        let is_orphaned = orphaned_at.is_some();
+        
+        // Calculate time until next heartbeat required
+        let time_until_heartbeat = if let Some(last_hb) = last_heartbeat {
+            let next_required = last_hb + HEARTBEAT_INTERVAL;
+            if next_required > current_time {
+                Some(next_required - current_time)
+            } else {
+                Some(0) // Overdue
+            }
+        } else {
+            Some(HEARTBEAT_INTERVAL) // No heartbeat yet
+        };
+        
+        // Calculate time until orphaned (if in crisis)
+        let time_until_orphaned = if let Some(crisis_start) = crisis_started_at {
+            let orphan_deadline = crisis_start + ORPHAN_THRESHOLD;
+            if orphan_deadline > current_time {
+                Some(orphan_deadline - current_time)
+            } else {
+                Some(0) // Already orphaned
+            }
+        } else {
+            None
+        };
+        
+        HeartbeatStatus {
+            circle_id,
+            last_heartbeat,
+            is_in_crisis,
+            crisis_started_at,
+            leadership_claimant,
+            claim_deadline,
+            is_orphaned,
+            orphaned_at,
+            time_until_heartbeat,
+            time_until_orphaned,
+        }
+    }
+
+// --- HEARTBEAT HELPER FUNCTIONS ---
+
+/// Check if a circle should enter leadership crisis state and emit appropriate events
+fn check_leadership_crisis(env: &Env, circle_id: u64) {
+    let current_time = env.ledger().timestamp();
+    let circle_key = DataKey::Circle(circle_id);
+    
+    // Only proceed if circle exists
+    let mut circle: CircleInfo = match env.storage().instance().get(&circle_key) {
+        Some(c) => c,
+        None => return, // Circle doesn't exist
+    };
+    
+    // Skip if already in crisis or orphaned
+    if circle.is_in_crisis || circle.orphaned_at.is_some() {
+        return;
+    }
+    
+    // Check if heartbeat is overdue
+    let last_heartbeat = circle.last_heartbeat.unwrap_or(0);
+    if last_heartbeat == 0 {
+        // No heartbeat ever received - use circle creation time
+        // For now, we'll assume circles start with a grace period
+        return;
+    }
+    
+    let next_required = last_heartbeat + HEARTBEAT_INTERVAL;
+    if current_time <= next_required {
+        return; // Heartbeat not overdue yet
+    }
+    
+    // Heartbeat is overdue - enter crisis state
+    circle.is_in_crisis = true;
+    circle.crisis_started_at = Some(current_time);
+    
+    // Update circle in storage
+    env.storage().instance().set(&circle_key, &circle);
+    
+    // Store crisis state
+    env.storage().instance().set(&DataKey::LeadershipCrisis(circle_id), &current_time);
+    
+    // Emit AdminHeartbeatLost event
+    env.events().publish(
+        symbol_short!("CRISIS"),
+        HeartbeatEvent::AdminHeartbeatLost {
+            circle_id,
+            last_heartbeat,
+            crisis_started: current_time,
+        },
+    );
+}
+
+/// Complete leadership transfer after challenge window expires
+fn complete_leadership_transfer(env: &Env, circle_id: u64) -> Result<(), u32> {
+    let current_time = env.ledger().timestamp();
+    let circle_key = DataKey::Circle(circle_id);
+    let mut circle: CircleInfo = env.storage().instance().get(&circle_key)
+        .expect("Circle not found");
+    
+    // Check if there's an active claim
+    let claimant = match circle.leadership_claimant {
+        Some(addr) => addr,
+        None => return Err(511); // No active claim
+    };
+    
+    // Check if challenge window has expired
+    let deadline = circle.claim_deadline.unwrap_or(0);
+    if current_time <= deadline {
+        return Err(512); // Challenge window still active
+    }
+    
+    let old_admin = circle.creator.clone();
+    
+    // Transfer leadership
+    circle.creator = claimant.clone();
+    circle.is_in_crisis = false;
+    circle.crisis_started_at = None;
+    circle.leadership_claimant = None;
+    circle.claim_deadline = None;
+    
+    // Update circle in storage
+    env.storage().instance().set(&circle_key, &circle);
+    
+    // Clean up leadership claim record
+    env.storage().instance().remove(&DataKey::LeadershipClaim(circle_id));
+    env.storage().instance().remove(&DataKey::LeadershipCrisis(circle_id));
+    
+    // Emit leadership transfer event
+    env.events().publish(
+        symbol_short!("TRANSFER"),
+        HeartbeatEvent::LeadershipTransferred {
+            circle_id,
+            old_admin,
+            new_admin: claimant,
+            transferred_at: current_time,
+        },
+    );
+    
+    Ok(())
+}
 
         // Verify session has 3 commits
         let session: VotingSession = env
