@@ -1,0 +1,1190 @@
+{
+  "version": "1.0.0",
+  "description": "SoroSusu Error Code Mapping for Frontend Integration",
+  "categories": {
+    "authentication": {
+      "description": "Authentication and authorization related errors",
+      "severity": "high",
+      "user_action": "please_contact_support"
+    },
+    "not_found": {
+      "description": "Resource not found errors",
+      "severity": "medium", 
+      "user_action": "verify_input"
+    },
+    "insufficient_funds": {
+      "description": "Insufficient balance errors",
+      "severity": "medium",
+      "user_action": "add_funds"
+    },
+    "paused": {
+      "description": "Contract paused or emergency mode errors",
+      "severity": "high",
+      "user_action": "try_later"
+    },
+    "arithmetic": {
+      "description": "Mathematical operation errors",
+      "severity": "high",
+      "user_action": "please_contact_support"
+    },
+    "general": {
+      "description": "General operational errors",
+      "severity": "medium",
+      "user_action": "verify_input"
+    }
+  },
+  "errors": {
+    "1000": {
+      "code": "Unauthorized",
+      "message": "Unauthorized access",
+      "category": "authentication",
+      "severity": "high",
+      "user_message": "You don't have permission to perform this action",
+      "user_action": "check_permissions",
+      "developer_notes": "User is not authorized to perform this operation"
+    },
+    "1001": {
+      "code": "AdminNotSet",
+      "message": "Admin address not set",
+      "category": "authentication",
+      "severity": "high",
+      "user_message": "System administrator not configured",
+      "user_action": "please_contact_support",
+      "developer_notes": "Admin address has not been set in contract"
+    },
+    "1002": {
+      "code": "CircleNotFound",
+      "message": "Circle not found",
+      "category": "not_found",
+      "severity": "medium",
+      "user_message": "The savings circle you're looking for doesn't exist",
+      "user_action": "verify_circle_id",
+      "developer_notes": "Circle with given ID does not exist"
+    },
+    "1003": {
+      "code": "MemberNotFound",
+      "message": "Member not found",
+      "category": "not_found",
+      "severity": "medium",
+      "user_message": "You're not a member of this savings circle",
+      "user_action": "join_circle_first",
+      "developer_notes": "Member address not found in circle"
+    },
+    "1004": {
+      "code": "MemberNotActive",
+      "message": "Member is not active",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Your membership is currently inactive",
+      "user_action": "check_member_status",
+      "developer_notes": "Member status is not Active"
+    },
+    "1005": {
+      "code": "AlreadyMember",
+      "message": "Already a member of this circle",
+      "category": "general",
+      "severity": "low",
+      "user_message": "You're already a member of this savings circle",
+      "user_action": "none",
+      "developer_notes": "User is already a member of the circle"
+    },
+    "1006": {
+      "code": "CircleFull",
+      "message": "Circle is full",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "This savings circle is currently full",
+      "user_action": "find_another_circle",
+      "developer_notes": "Circle has reached maximum member count"
+    },
+    "1007": {
+      "code": "NoMembersInCircle",
+      "message": "No members in circle",
+      "category": "general",
+      "severity": "high",
+      "user_message": "This savings circle has no members",
+      "user_action": "please_contact_support",
+      "developer_notes": "Circle member count is zero"
+    },
+    "1008": {
+      "code": "InvalidInput",
+      "message": "Invalid input provided",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Please check your input and try again",
+      "user_action": "verify_input",
+      "developer_notes": "Input validation failed"
+    },
+    "1009": {
+      "code": "Overflow",
+      "message": "Arithmetic overflow",
+      "category": "arithmetic",
+      "severity": "high",
+      "user_message": "Transaction amount too large",
+      "user_action": "reduce_amount",
+      "developer_notes": "Arithmetic operation overflow detected"
+    },
+    "1010": {
+      "code": "Underflow",
+      "message": "Arithmetic underflow",
+      "category": "arithmetic",
+      "severity": "high",
+      "user_message": "Invalid transaction amount",
+      "user_action": "verify_amount",
+      "developer_notes": "Arithmetic operation underflow detected"
+    },
+    "1011": {
+      "code": "DivisionByZero",
+      "message": "Division by zero",
+      "category": "arithmetic",
+      "severity": "high",
+      "user_message": "Invalid calculation attempted",
+      "user_action": "please_contact_support",
+      "developer_notes": "Division by zero attempted"
+    },
+    "1012": {
+      "code": "InvalidAddress",
+      "message": "Invalid address format",
+      "category": "authentication",
+      "severity": "medium",
+      "user_message": "Invalid wallet address provided",
+      "user_action": "verify_address",
+      "developer_notes": "Address format validation failed"
+    },
+    "1013": {
+      "code": "ContractPaused",
+      "message": "Contract is paused",
+      "category": "paused",
+      "severity": "high",
+      "user_message": "The system is temporarily paused for maintenance",
+      "user_action": "try_later",
+      "developer_notes": "Contract is in paused state"
+    },
+    "1014": {
+      "code": "EmergencyMode",
+      "message": "Contract in emergency mode",
+      "category": "paused",
+      "severity": "high",
+      "user_message": "The system is in emergency mode",
+      "user_action": "try_later",
+      "developer_notes": "Contract is in emergency mode"
+    },
+    "2000": {
+      "code": "CycleNotMatured",
+      "message": "Cycle has not matured yet",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "This round hasn't completed yet",
+      "user_action": "wait_for_completion",
+      "developer_notes": "Cycle duration has not elapsed"
+    },
+    "2001": {
+      "code": "RoundAlreadyFinalized",
+      "message": "Round already finalized",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "This round has already been finalized",
+      "user_action": "check_next_round",
+      "developer_notes": "Round has already been finalized"
+    },
+    "2002": {
+      "code": "InvalidRound",
+      "message": "Invalid round number",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid round number specified",
+      "user_action": "verify_round_number",
+      "developer_notes": "Round number validation failed"
+    },
+    "2003": {
+      "code": "CircleCompleted",
+      "message": "Circle has been completed",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "This savings circle has been completed",
+      "user_action": "create_new_circle",
+      "developer_notes": "Circle has completed all rounds"
+    },
+    "2004": {
+      "code": "CircleNotStarted",
+      "message": "Circle has not started",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "This savings circle hasn't started yet",
+      "user_action": "wait_for_start",
+      "developer_notes": "Circle start condition not met"
+    },
+    "2005": {
+      "code": "InvalidCycleDuration",
+      "message": "Invalid cycle duration",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid cycle duration specified",
+      "user_action": "verify_duration",
+      "developer_notes": "Cycle duration validation failed"
+    },
+    "2006": {
+      "code": "MaxCycleDurationExceeded",
+      "message": "Cycle duration exceeds maximum limit",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Cycle duration exceeds maximum allowed limit",
+      "user_action": "reduce_duration",
+      "developer_notes": "Cycle duration exceeds MAX_CYCLE_DURATION"
+    },
+    "2007": {
+      "code": "LeadershipCrisis",
+      "message": "Leadership crisis detected",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Leadership crisis detected in this circle",
+      "user_action": "please_contact_support",
+      "developer_notes": "Leadership crisis condition detected"
+    },
+    "2008": {
+      "code": "NoRecipientSet",
+      "message": "No recipient set for current round",
+      "category": "general",
+      "severity": "high",
+      "user_message": "No recipient set for current round",
+      "user_action": "please_contact_support",
+      "developer_notes": "Current round recipient not set"
+    },
+    "2009": {
+      "code": "InvalidRecipient",
+      "message": "Invalid recipient address",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Invalid recipient address",
+      "user_action": "please_contact_support",
+      "developer_notes": "Recipient address validation failed"
+    },
+    "3000": {
+      "code": "InvalidContributionAmount",
+      "message": "Invalid contribution amount",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid contribution amount specified",
+      "user_action": "verify_amount",
+      "developer_notes": "Contribution amount validation failed"
+    },
+    "3001": {
+      "code": "InsufficientBalance",
+      "message": "Insufficient token balance",
+      "category": "insufficient_funds",
+      "severity": "medium",
+      "user_message": "Insufficient balance for this contribution",
+      "user_action": "add_funds",
+      "developer_notes": "User token balance insufficient"
+    },
+    "3002": {
+      "code": "ContributionOverflow",
+      "message": "Contribution amount overflow",
+      "category": "arithmetic",
+      "severity": "high",
+      "user_message": "Contribution amount too large",
+      "user_action": "reduce_amount",
+      "developer_notes": "Contribution calculation overflow"
+    },
+    "3003": {
+      "code": "ZeroRounds",
+      "message": "Number of rounds must be greater than zero",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Number of rounds must be greater than zero",
+      "user_action": "increase_rounds",
+      "developer_notes": "Rounds parameter must be > 0"
+    },
+    "3004": {
+      "code": "ContributionTransactionFailed",
+      "message": "Contribution transaction failed",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Contribution transaction failed",
+      "user_action": "try_again",
+      "developer_notes": "Contribution security transaction failed"
+    },
+    "3005": {
+      "code": "InvalidContributionWindow",
+      "message": "Invalid contribution window",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Contributions are not currently accepted",
+      "user_action": "check_contribution_window",
+      "developer_notes": "Outside contribution time window"
+    },
+    "3006": {
+      "code": "MaxContributionExceeded",
+      "message": "Maximum contribution exceeded",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Maximum contribution limit exceeded",
+      "user_action": "reduce_amount",
+      "developer_notes": "Contribution exceeds maximum limit"
+    },
+    "3007": {
+      "code": "ContributionAlreadyMade",
+      "message": "Contribution already made for this round",
+      "category": "general",
+      "severity": "low",
+      "user_message": "You've already contributed for this round",
+      "user_action": "none",
+      "developer_notes": "Contribution already made for current round"
+    },
+    "3008": {
+      "code": "InvalidToken",
+      "message": "Invalid token address",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid token specified",
+      "user_action": "verify_token",
+      "developer_notes": "Token address validation failed"
+    },
+    "3009": {
+      "code": "TrustlineMissing",
+      "message": "Required trustline missing",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Please establish the required trustline first",
+      "user_action": "setup_trustline",
+      "developer_notes": "Required token trustline not established"
+    },
+    "4000": {
+      "code": "MemberIndexOutOfBounds",
+      "message": "Member index out of bounds",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid member index specified",
+      "user_action": "verify_member_index",
+      "developer_notes": "Member index exceeds member count"
+    },
+    "4001": {
+      "code": "MaxGroupSizeExceeded",
+      "message": "Maximum group size exceeded",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Group size exceeds maximum limit",
+      "user_action": "reduce_group_size",
+      "developer_notes": "Group size exceeds MAX_GROUP_SIZE"
+    },
+    "4002": {
+      "code": "InvalidMemberStatus",
+      "message": "Invalid member status",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid member status",
+      "user_action": "check_member_status",
+      "developer_notes": "Member status validation failed"
+    },
+    "4003": {
+      "code": "MemberAlreadyExists",
+      "message": "Member already exists",
+      "category": "general",
+      "severity": "low",
+      "user_message": "Member already exists in circle",
+      "user_action": "none",
+      "developer_notes": "Duplicate member addition attempted"
+    },
+    "4004": {
+      "code": "InvalidShares",
+      "message": "Shares must be 1 or 2",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Shares must be either 1 or 2",
+      "user_action": "set_valid_shares",
+      "developer_notes": "Shares parameter must be 1 or 2"
+    },
+    "4005": {
+      "code": "MemberSuspended",
+      "message": "Member is suspended",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Your membership is currently suspended",
+      "user_action": "please_contact_support",
+      "developer_notes": "Member status is Suspended"
+    },
+    "4006": {
+      "code": "MemberDefaulted",
+      "message": "Member has defaulted",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Member has defaulted on contributions",
+      "user_action": "please_contact_support",
+      "developer_notes": "Member status is Defaulted"
+    },
+    "4007": {
+      "code": "InvalidMemberIndex",
+      "message": "Invalid member index",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid member index specified",
+      "user_action": "verify_member_index",
+      "developer_notes": "Member index validation failed"
+    },
+    "4008": {
+      "code": "MemberNotEligible",
+      "message": "Member not eligible for this operation",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "You're not eligible for this operation",
+      "user_action": "check_eligibility",
+      "developer_notes": "Member eligibility check failed"
+    },
+    "5000": {
+      "code": "InvalidAmount",
+      "message": "Invalid amount specified",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid amount specified",
+      "user_action": "verify_amount",
+      "developer_notes": "Amount validation failed"
+    },
+    "5001": {
+      "code": "InsufficientFunds",
+      "message": "Insufficient funds available",
+      "category": "insufficient_funds",
+      "severity": "medium",
+      "user_message": "Insufficient funds for this transaction",
+      "user_action": "add_funds",
+      "developer_notes": "Available funds insufficient"
+    },
+    "5002": {
+      "code": "AmountBelowMinimum",
+      "message": "Amount below minimum threshold",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Amount below minimum threshold",
+      "user_action": "increase_amount",
+      "developer_notes": "Amount below minimum required"
+    },
+    "5003": {
+      "code": "AmountAboveMaximum",
+      "message": "Amount above maximum threshold",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Amount above maximum threshold",
+      "user_action": "reduce_amount",
+      "developer_notes": "Amount exceeds maximum allowed"
+    },
+    "5004": {
+      "code": "InvalidFee",
+      "message": "Invalid fee specified",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid fee specified",
+      "user_action": "verify_fee",
+      "developer_notes": "Fee validation failed"
+    },
+    "5005": {
+      "code": "FeeExceedsLimit",
+      "message": "Fee exceeds allowed limit",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Fee exceeds allowed limit",
+      "user_action": "reduce_fee",
+      "developer_notes": "Fee exceeds maximum allowed"
+    },
+    "5006": {
+      "code": "InvalidInsuranceFee",
+      "message": "Invalid insurance fee",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid insurance fee specified",
+      "user_action": "verify_insurance_fee",
+      "developer_notes": "Insurance fee validation failed"
+    },
+    "5007": {
+      "code": "InsuranceFeeExceedsLimit",
+      "message": "Insurance fee exceeds 100%",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Insurance fee cannot exceed 100%",
+      "user_action": "reduce_insurance_fee",
+      "developer_notes": "Insurance fee > 100% (10,000 bps)"
+    },
+    "5008": {
+      "code": "InvalidInterestRate",
+      "message": "Invalid interest rate",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid interest rate specified",
+      "user_action": "verify_interest_rate",
+      "developer_notes": "Interest rate validation failed"
+    },
+    "5009": {
+      "code": "InterestRateExceedsLimit",
+      "message": "Interest rate exceeds limit",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Interest rate exceeds allowed limit",
+      "user_action": "reduce_interest_rate",
+      "developer_notes": "Interest rate exceeds maximum allowed"
+    },
+    "6000": {
+      "code": "LendingMarketNotInitialized",
+      "message": "Lending market not initialized",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Lending market is not yet initialized",
+      "user_action": "please_contact_support",
+      "developer_notes": "Lending market configuration not found"
+    },
+    "6001": {
+      "code": "LendingMarketDisabled",
+      "message": "Lending market is disabled",
+      "category": "paused",
+      "severity": "high",
+      "user_message": "Lending market is currently disabled",
+      "user_action": "try_later",
+      "developer_notes": "Lending market disabled or in emergency mode"
+    },
+    "6002": {
+      "code": "PoolNotFound",
+      "message": "Lending pool not found",
+      "category": "not_found",
+      "severity": "medium",
+      "user_message": "Lending pool not found",
+      "user_action": "verify_pool_id",
+      "developer_notes": "Lending pool with given ID not found"
+    },
+    "6003": {
+      "code": "PoolNotActive",
+      "message": "Lending pool is not active",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "This lending pool is not active",
+      "user_action": "check_pool_status",
+      "developer_notes": "Lending pool is not active"
+    },
+    "6004": {
+      "code": "InsufficientPoolLiquidity",
+      "message": "Insufficient pool liquidity",
+      "category": "insufficient_funds",
+      "severity": "medium",
+      "user_message": "Insufficient liquidity in lending pool",
+      "user_action": "reduce_amount_or_wait",
+      "developer_notes": "Pool available amount insufficient"
+    },
+    "6005": {
+      "code": "PositionNotFound",
+      "message": "Lending position not found",
+      "category": "not_found",
+      "severity": "medium",
+      "user_message": "Lending position not found",
+      "user_action": "verify_position_id",
+      "developer_notes": "Lending position with given ID not found"
+    },
+    "6006": {
+      "code": "LoanNotActive",
+      "message": "Loan is not active",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "This loan is not currently active",
+      "user_action": "check_loan_status",
+      "developer_notes": "Loan status is not Active"
+    },
+    "6007": {
+      "code": "PaymentExceedsBalance",
+      "message": "Payment exceeds remaining balance",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Payment amount exceeds remaining loan balance",
+      "user_action": "reduce_payment_amount",
+      "developer_notes": "Payment amount > remaining balance"
+    },
+    "6008": {
+      "code": "ScheduleNotFound",
+      "message": "Repayment schedule not found",
+      "category": "not_found",
+      "severity": "medium",
+      "user_message": "Repayment schedule not found",
+      "user_action": "verify_schedule_id",
+      "developer_notes": "Repayment schedule with given ID not found"
+    },
+    "6009": {
+      "code": "InvalidLTVRatio",
+      "message": "Invalid loan-to-value ratio",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid loan-to-value ratio",
+      "user_action": "verify_ltv_ratio",
+      "developer_notes": "LTV ratio validation failed"
+    },
+    "6010": {
+      "code": "MaxLTVExceeded",
+      "message": "Amount exceeds maximum LTV ratio",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Loan amount exceeds maximum LTV ratio",
+      "user_action": "reduce_loan_amount",
+      "developer_notes": "Amount exceeds max LTV ratio"
+    },
+    "6011": {
+      "code": "EmergencyLoanNotFound",
+      "message": "Emergency loan not found",
+      "category": "not_found",
+      "severity": "medium",
+      "user_message": "Emergency loan not found",
+      "user_action": "verify_loan_id",
+      "developer_notes": "Emergency loan with given ID not found"
+    },
+    "6012": {
+      "code": "VotingPeriodEnded",
+      "message": "Voting period has ended",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Voting period for this emergency loan has ended",
+      "user_action": "voting_closed",
+      "developer_notes": "Voting deadline passed"
+    },
+    "6013": {
+      "code": "InsufficientVotes",
+      "message": "Insufficient votes for approval",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Insufficient votes for emergency loan approval",
+      "user_action": "get_more_votes",
+      "developer_notes": "Quorum not met for approval"
+    },
+    "7000": {
+      "code": "VotingSessionNotFound",
+      "message": "Voting session not found",
+      "category": "not_found",
+      "severity": "medium",
+      "user_message": "Voting session not found",
+      "user_action": "verify_session_id",
+      "developer_notes": "Voting session with given ID not found"
+    },
+    "7001": {
+      "code": "VotingNotActive",
+      "message": "Voting is not currently active",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Voting is not currently active",
+      "user_action": "check_voting_schedule",
+      "developer_notes": "Voting session not in active state"
+    },
+    "7002": {
+      "code": "AlreadyVoted",
+      "message": "Already voted on this proposal",
+      "category": "general",
+      "severity": "low",
+      "user_message": "You've already voted on this proposal",
+      "user_action": "none",
+      "developer_notes": "User has already voted"
+    },
+    "7003": {
+      "code": "InvalidVote",
+      "message": "Invalid vote option",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid vote option selected",
+      "user_action": "select_valid_option",
+      "developer_notes": "Vote option validation failed"
+    },
+    "7004": {
+      "code": "QuorumNotMet",
+      "message": "Quorum not met",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Not enough votes to meet quorum",
+      "user_action": "get_more_votes",
+      "developer_notes": "Quorum requirements not met"
+    },
+    "7005": {
+      "code": "ProposalNotFound",
+      "message": "Proposal not found",
+      "category": "not_found",
+      "severity": "medium",
+      "user_message": "Proposal not found",
+      "user_action": "verify_proposal_id",
+      "developer_notes": "Proposal with given ID not found"
+    },
+    "7006": {
+      "code": "ProposalExpired",
+      "message": "Proposal has expired",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "This proposal has expired",
+      "user_action": "create_new_proposal",
+      "developer_notes": "Proposal voting period ended"
+    },
+    "7007": {
+      "code": "InvalidProposal",
+      "message": "Invalid proposal data",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid proposal data",
+      "user_action": "fix_proposal_data",
+      "developer_notes": "Proposal validation failed"
+    },
+    "7008": {
+      "code": "UnauthorizedGovernanceAction",
+      "message": "Unauthorized governance action",
+      "category": "authentication",
+      "severity": "high",
+      "user_message": "You're not authorized for this governance action",
+      "user_action": "check_permissions",
+      "developer_notes": "User lacks governance permissions"
+    },
+    "8000": {
+      "code": "NoActiveMembers",
+      "message": "No active members for recovery",
+      "category": "general",
+      "severity": "high",
+      "user_message": "No active members available for recovery",
+      "user_action": "please_contact_support",
+      "developer_notes": "No active members for recovery process"
+    },
+    "8001": {
+      "code": "RecoveryProposalNotFound",
+      "message": "No recovery proposal found",
+      "category": "not_found",
+      "severity": "medium",
+      "user_message": "No recovery proposal found",
+      "user_action": "submit_recovery_proposal",
+      "developer_notes": "Recovery proposal not found"
+    },
+    "8002": {
+      "code": "OldMemberNotFound",
+      "message": "Old member not found for recovery",
+      "category": "not_found",
+      "severity": "medium",
+      "user_message": "Original member not found for recovery",
+      "user_action": "verify_old_member",
+      "developer_notes": "Old member address not found"
+    },
+    "8003": {
+      "code": "NewMemberAlreadyExists",
+      "message": "New member address already exists",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "New member address already exists in circle",
+      "user_action": "use_different_address",
+      "developer_notes": "New address already a member"
+    },
+    "8004": {
+      "code": "InvalidRecoveryAddress",
+      "message": "Invalid recovery address",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid recovery address specified",
+      "user_action": "verify_recovery_address",
+      "developer_notes": "Recovery address validation failed"
+    },
+    "8005": {
+      "code": "RecoveryConsensusNotMet",
+      "message": "Recovery consensus not met",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Insufficient consensus for recovery",
+      "user_action": "get_more_votes",
+      "developer_notes": "Recovery consensus threshold not met"
+    },
+    "8006": {
+      "code": "RecoveryWindowExpired",
+      "message": "Recovery window has expired",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Recovery window has expired",
+      "user_action": "submit_new_proposal",
+      "developer_notes": "Recovery time window expired"
+    },
+    "9000": {
+      "code": "YieldBalanceNotFound",
+      "message": "Yield balance not found",
+      "category": "not_found",
+      "severity": "medium",
+      "user_message": "Yield balance not found",
+      "user_action": "check_yield_status",
+      "developer_notes": "Yield balance for member not found"
+    },
+    "9001": {
+      "code": "HarvestNotAvailable",
+      "message": "Harvest not available at this time",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Yield harvest not currently available",
+      "user_action": "try_later",
+      "developer_notes": "Harvest conditions not met"
+    },
+    "9002": {
+      "code": "InvalidYieldAllocation",
+      "message": "Invalid yield allocation",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid yield allocation specified",
+      "user_action": "verify_allocation",
+      "developer_notes": "Yield allocation validation failed"
+    },
+    "9003": {
+      "code": "YieldCalculationError",
+      "message": "Yield calculation error",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Error calculating yield distribution",
+      "user_action": "please_contact_support",
+      "developer_notes": "Yield calculation failed"
+    },
+    "9004": {
+      "code": "BatchHarvestInProgress",
+      "message": "Batch harvest already in progress",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Batch harvest already in progress",
+      "user_action": "wait_for_completion",
+      "developer_notes": "Batch harvest operation in progress"
+    },
+    "9005": {
+      "code": "InsufficientYield",
+      "message": "Insufficient yield to distribute",
+      "category": "insufficient_funds",
+      "severity": "medium",
+      "user_message": "Insufficient yield available for distribution",
+      "user_action": "wait_for_more_yield",
+      "developer_notes": "Yield amount insufficient"
+    },
+    "9006": {
+      "code": "YieldDistributionFailed",
+      "message": "Yield distribution failed",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Yield distribution failed",
+      "user_action": "try_again",
+      "developer_notes": "Yield distribution operation failed"
+    },
+    "10000": {
+      "code": "DisputeNotFound",
+      "message": "Dispute not found",
+      "category": "not_found",
+      "severity": "medium",
+      "user_message": "Dispute not found",
+      "user_action": "verify_dispute_id",
+      "developer_notes": "Dispute with given ID not found"
+    },
+    "10001": {
+      "code": "DisputeNotActive",
+      "message": "Dispute is not active",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "This dispute is not currently active",
+      "user_action": "check_dispute_status",
+      "developer_notes": "Dispute status not active"
+    },
+    "10002": {
+      "code": "InvalidDisputeStatus",
+      "message": "Invalid dispute status",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid dispute status",
+      "user_action": "check_dispute_status",
+      "developer_notes": "Dispute status validation failed"
+    },
+    "10003": {
+      "code": "JurorNotSelected",
+      "message": "Juror not selected",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Juror not selected for this dispute",
+      "user_action": "wait_for_juror_selection",
+      "developer_notes": "Juror selection not completed"
+    },
+    "10004": {
+      "code": "InvalidEvidence",
+      "message": "Invalid evidence provided",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid evidence provided",
+      "user_action": "provide_valid_evidence",
+      "developer_notes": "Evidence validation failed"
+    },
+    "10005": {
+      "code": "DisputeExpired",
+      "message": "Dispute has expired",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "This dispute has expired",
+      "user_action": "create_new_dispute",
+      "developer_notes": "Dispute resolution period expired"
+    },
+    "10006": {
+      "code": "InsufficientDisputeBond",
+      "message": "Insufficient dispute bond",
+      "category": "insufficient_funds",
+      "severity": "medium",
+      "user_message": "Insufficient dispute bond posted",
+      "user_action": "increase_bond",
+      "developer_notes": "Dispute bond below required minimum"
+    },
+    "11000": {
+      "code": "ReentrancyDetected",
+      "message": "Reentrancy attack detected",
+      "category": "security",
+      "severity": "high",
+      "user_message": "Security violation detected",
+      "user_action": "please_contact_support",
+      "developer_notes": "Reentrancy guard triggered"
+    },
+    "11001": {
+      "code": "InvalidSignature",
+      "message": "Invalid signature provided",
+      "category": "security",
+      "severity": "high",
+      "user_message": "Invalid signature provided",
+      "user_action": "verify_signature",
+      "developer_notes": "Signature verification failed"
+    },
+    "11002": {
+      "code": "AuthenticationFailed",
+      "message": "Authentication failed",
+      "category": "authentication",
+      "severity": "high",
+      "user_message": "Authentication failed",
+      "user_action": "check_credentials",
+      "developer_notes": "Authentication process failed"
+    },
+    "11003": {
+      "code": "PasskeyInvalid",
+      "message": "Invalid passkey authentication",
+      "category": "authentication",
+      "severity": "high",
+      "user_message": "Invalid passkey authentication",
+      "user_action": "verify_passkey",
+      "developer_notes": "Passkey authentication failed"
+    },
+    "11004": {
+      "code": "MerkleProofInvalid",
+      "message": "Invalid Merkle proof",
+      "category": "security",
+      "severity": "high",
+      "user_message": "Invalid Merkle proof provided",
+      "user_action": "verify_proof",
+      "developer_notes": "Merkle proof verification failed"
+    },
+    "11005": {
+      "code": "ContributionSecurityViolation",
+      "message": "Contribution security violation",
+      "category": "security",
+      "severity": "high",
+      "user_message": "Contribution security violation detected",
+      "user_action": "please_contact_support",
+      "developer_notes": "Contribution security check failed"
+    },
+    "12000": {
+      "code": "OracleUnavailable",
+      "message": "Price oracle unavailable",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Price oracle temporarily unavailable",
+      "user_action": "try_later",
+      "developer_notes": "Price oracle not responding"
+    },
+    "12001": {
+      "code": "PriceStale",
+      "message": "Price data is stale",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Price data is outdated",
+      "user_action": "try_later",
+      "developer_notes": "Price data exceeds staleness threshold"
+    },
+    "12002": {
+      "code": "InvalidPrice",
+      "message": "Invalid price data",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid price data received",
+      "user_action": "try_later",
+      "developer_notes": "Price data validation failed"
+    },
+    "12003": {
+      "code": "PriceFeedError",
+      "message": "Price feed error",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Price feed error occurred",
+      "user_action": "try_later",
+      "developer_notes": "Price feed operation failed"
+    },
+    "12004": {
+      "code": "CircuitBreakerTriggered",
+      "message": "Circuit breaker triggered",
+      "category": "paused",
+      "severity": "high",
+      "user_message": "Circuit breaker triggered for safety",
+      "user_action": "try_later",
+      "developer_notes": "Circuit breaker protection activated"
+    },
+    "13000": {
+      "code": "TaxConfigurationNotFound",
+      "message": "Tax configuration not found",
+      "category": "not_found",
+      "severity": "medium",
+      "user_message": "Tax configuration not found",
+      "user_action": "setup_tax_config",
+      "developer_notes": "Tax configuration for circle not found"
+    },
+    "13001": {
+      "code": "InvalidTaxRate",
+      "message": "Invalid tax rate",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid tax rate specified",
+      "user_action": "verify_tax_rate",
+      "developer_notes": "Tax rate validation failed"
+    },
+    "13002": {
+      "code": "TaxExemptionInvalid",
+      "message": "Invalid tax exemption",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid tax exemption status",
+      "user_action": "verify_exemption",
+      "developer_notes": "Tax exemption validation failed"
+    },
+    "13003": {
+      "code": "TaxWithholdingFailed",
+      "message": "Tax withholding failed",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Tax withholding operation failed",
+      "user_action": "try_again",
+      "developer_notes": "Tax withholding operation failed"
+    },
+    "13004": {
+      "code": "ComplianceCheckFailed",
+      "message": "Compliance check failed",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Compliance check failed",
+      "user_action": "please_contact_support",
+      "developer_notes": "Regulatory compliance check failed"
+    },
+    "14000": {
+      "code": "AuditEntryNotFound",
+      "message": "Audit entry not found",
+      "category": "not_found",
+      "severity": "low",
+      "user_message": "Audit entry not found",
+      "user_action": "verify_audit_id",
+      "developer_notes": "Audit entry with given ID not found"
+    },
+    "14001": {
+      "code": "LoggingFailed",
+      "message": "Logging operation failed",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Logging operation failed",
+      "user_action": "try_again",
+      "developer_notes": "Audit logging operation failed"
+    },
+    "14002": {
+      "code": "InvalidAuditTrail",
+      "message": "Invalid audit trail",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid audit trail",
+      "user_action": "verify_audit_trail",
+      "developer_notes": "Audit trail validation failed"
+    },
+    "15000": {
+      "code": "AnchorNotRegistered",
+      "message": "Anchor not registered",
+      "category": "not_found",
+      "severity": "medium",
+      "user_message": "Anchor not registered",
+      "user_action": "register_anchor",
+      "developer_notes": "Anchor registration not found"
+    },
+    "15001": {
+      "code": "AnchorDepositNotFound",
+      "message": "Anchor deposit not found",
+      "category": "not_found",
+      "severity": "medium",
+      "user_message": "Anchor deposit not found",
+      "user_action": "verify_deposit_id",
+      "developer_notes": "Anchor deposit with given ID not found"
+    },
+    "15002": {
+      "code": "InvalidAnchorConfiguration",
+      "message": "Invalid anchor configuration",
+      "category": "general",
+      "severity": "medium",
+      "user_message": "Invalid anchor configuration",
+      "user_action": "fix_anchor_config",
+      "developer_notes": "Anchor configuration validation failed"
+    },
+    "15003": {
+      "code": "AnchorTransferFailed",
+      "message": "Anchor transfer failed",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Anchor transfer failed",
+      "user_action": "try_again",
+      "developer_notes": "Anchor transfer operation failed"
+    },
+    "17000": {
+      "code": "InternalError",
+      "message": "Internal contract error",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Internal system error occurred",
+      "user_action": "please_contact_support",
+      "developer_notes": "Unexpected internal error"
+    },
+    "17001": {
+      "code": "StorageError",
+      "message": "Storage operation error",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Storage operation error occurred",
+      "user_action": "try_again",
+      "developer_notes": "Storage operation failed"
+    },
+    "17002": {
+      "code": "SerializationError",
+      "message": "Data serialization error",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Data processing error occurred",
+      "user_action": "please_contact_support",
+      "developer_notes": "Data serialization failed"
+    },
+    "17003": {
+      "code": "DeserializationError",
+      "message": "Data deserialization error",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Data processing error occurred",
+      "user_action": "please_contact_support",
+      "developer_notes": "Data deserialization failed"
+    },
+    "17004": {
+      "code": "InvalidStorageKey",
+      "message": "Invalid storage key",
+      "category": "general",
+      "severity": "high",
+      "user_message": "Internal storage error occurred",
+      "user_action": "please_contact_support",
+      "developer_notes": "Storage key validation failed"
+    },
+    "17005": {
+      "code": "ContractInvariantViolation",
+      "message": "Contract invariant violation",
+      "category": "security",
+      "severity": "high",
+      "user_message": "Contract security violation detected",
+      "user_action": "please_contact_support",
+      "developer_notes": "Contract invariant violation detected"
+    }
+  },
+  "usage_notes": {
+    "error_handling": "Always handle errors gracefully and display user-friendly messages",
+    "logging": "Log error codes for debugging, but never log sensitive user data",
+    "localization": "Use the error code for localization purposes",
+    "categorization": "Use the category field for UI styling and routing",
+    "severity": "Use severity to determine UI prominence (error, warning, info)",
+    "user_actions": "Guide users with specific actionable steps",
+    "developer_notes": "Include developer notes in bug reports for faster debugging"
+  }
+}

@@ -5,6 +5,9 @@ use soroban_sdk::{
     Symbol, Vec, Bytes, BytesN,
 };
 
+pub mod errors;
+pub use errors::{SoroSusuError, SoroSusuResult};
+
 pub mod chat_metadata;
 pub mod dispute;
 pub mod yield_allocation_voting;
@@ -433,13 +436,13 @@ pub trait SoroSusuTrait {
         risk_tolerance: u32,
         grace_period: u64,
         late_fee_bps: u32,
-    ) -> u64;
+    ) -> SoroSusuResult<u64>;
 
     // Join an existing circle
-    fn join_circle(env: Env, user: Address, circle_id: u64);
+    fn join_circle(env: Env, user: Address, circle_id: u64) -> SoroSusuResult<()>;
 
     // Make a batch deposit for one or more rounds.
-    fn deposit(env: Env, user: Address, circle_id: u64, rounds: u32);
+    fn deposit(env: Env, user: Address, circle_id: u64, rounds: u32) -> SoroSusuResult<()>;
 
     // Late contribution with fee (pay after deadline but within grace period)
     fn late_contribution(env: Env, user: Address, circle_id: u64);
@@ -2671,12 +2674,12 @@ fn create_circle(
         cycle_duration: u64,
         insurance_fee_bps: u32,
         nft_contract: Address,
-    ) -> u64 {
+    ) -> SoroSusuResult<u64> {
         creator.require_auth();
 
         // Validate insurance fee (cannot exceed 100%)
         if insurance_fee_bps > 10_000 {
-            panic!("Insurance fee cannot exceed 100%");
+            return Err(SoroSusuError::InsuranceFeeExceedsLimit);
         }
 
         // Get the current Circle Count
@@ -2736,7 +2739,7 @@ fn create_circle(
         // Update the circle count
         env.storage().instance().set(&DataKey::CircleCount, &circle_count);
 
-        circle_count
+        Ok(circle_count)
     }
 
     /// Adds a member to an existing open circle.
@@ -2753,28 +2756,28 @@ fn create_circle(
     /// - `"Group size limit exceeded"` — attempting to exceed MAX_GROUP_SIZE.
     /// - `"Already a member"` — `user` is already in the circle.
     /// - `"Shares must be 1 or 2"` — invalid `shares` value.
-    fn join_circle(env: Env, user: Address, circle_id: u64, shares: u32, guarantor: Option<Address>) {
+    fn join_circle(env: Env, user: Address, circle_id: u64, shares: u32, guarantor: Option<Address>) -> SoroSusuResult<()> {
         // Authorization: The user MUST sign this transaction
         user.require_auth();
 
         // Validate shares (must be 1 or 2)
         if shares != 1 && shares != 2 {
-            panic!("Shares must be 1 or 2");
+            return Err(SoroSusuError::InvalidShares);
         }
 
         // Check if the circle exists
         let mut circle: CircleInfo = env.storage().instance()
             .get(&DataKey::Circle(circle_id))
-            .unwrap_or_else(|| panic!("Circle not found"));
+            .ok_or(SoroSusuError::CircleNotFound)?;
 
         // Check if the circle is full
         if circle.member_count >= circle.max_members {
-            panic!("Circle is full");
+            return Err(SoroSusuError::CircleFull);
         }
 
         // Enforce MAX_GROUP_SIZE for Vec-based storage optimization
         if circle.member_count >= MAX_GROUP_SIZE {
-            panic!("Group size limit exceeded");
+            return Err(SoroSusuError::MaxGroupSizeExceeded);
         }
 
         // Load existing members Vec
@@ -2782,7 +2785,7 @@ fn create_circle(
 
         // Check if the user is already a member (O(n) scan acceptable for n ≤ 20)
         if find_member(&members, &user).is_some() {
-            panic!("Already a member");
+            return Err(SoroSusuError::AlreadyMember);
         }
 
         // Add the user to the members list in CircleInfo (for backward compatibility)
@@ -2816,6 +2819,8 @@ fn create_circle(
 
         // Update the circle
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        
+        Ok(())
     }
 
     /// Submits the caller's contribution for one or more rounds.
@@ -2838,10 +2843,10 @@ fn create_circle(
     /// # Panics
     /// - `"Circle not found"` — `circle_id` does not exist.
     /// - `"Member not found"` — `user` is not a member of the circle.
-    fn deposit(env: Env, user: Address, circle_id: u64, rounds: u32) {
+    fn deposit(env: Env, user: Address, circle_id: u64, rounds: u32) -> SoroSusuResult<()> {
         user.require_auth();
         if rounds == 0 {
-            panic!("Rounds must be greater than zero");
+            return Err(SoroSusuError::ZeroRounds);
         }
 
         // Check for leadership crisis before processing deposit
@@ -2849,22 +2854,22 @@ fn create_circle(
 
         let circle: CircleInfo = env.storage().instance()
             .get(&DataKey::Circle(circle_id))
-            .unwrap_or_else(|| panic!("Circle not found"));
+            .ok_or(SoroSusuError::CircleNotFound)?;
 
         // Load members Vec
         let mut members = load_members(&env, circle_id);
 
         // Find and update member (O(n) scan acceptable for n ≤ 20)
         let member = get_member_mut(&mut members, &user)
-            .unwrap_or_else(|| panic!("Member not found"));
+            .ok_or(SoroSusuError::MemberNotFound)?;
 
         if member.status != MemberStatus::Active {
-            panic!("Member not active");
+            return Err(SoroSusuError::MemberNotActive);
         }
 
         let total_contribution = circle.contribution_amount
             .checked_mul(rounds as i128)
-            .unwrap_or_else(|| panic!("Contribution overflow"));
+            .ok_or(SoroSusuError::ContributionOverflow)?;
 
         // Start atomic transaction
         let tx_id = contribution_security::ContributionSecurityTrait::start_contribution_transaction(
@@ -2873,7 +2878,7 @@ fn create_circle(
             circle_id,
             total_contribution as u64,
             rounds,
-        ).unwrap_or_else(|e| panic!("Failed to start transaction: {:?}", e));
+        ).map_err(|_| SoroSusuError::ContributionTransactionFailed)?;
 
         // Execute the token transfer
         let token_client = soroban_sdk::token::Client::new(&env, &circle.token);
@@ -2886,18 +2891,20 @@ fn create_circle(
 
         member_mut.contribution_count = member_mut.contribution_count
             .checked_add(rounds)
-            .unwrap_or_else(|| panic!("Contribution count overflow"));
+            .ok_or(SoroSusuError::Overflow)?;
         member_mut.last_contribution_time = current_time;
 
         let contribution_bit = 1u64
             .checked_shl(member_mut.index)
-            .unwrap_or_else(|| panic!("Member index overflow"));
+            .ok_or(SoroSusuError::MemberIndexOverflow)?;
         circle_mut.contribution_bitmap |= contribution_bit;
 
         // Save updated members Vec (single storage write)
         save_members(&env, circle_id, &members);
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
         env.storage().instance().set(&DataKey::Deposit(circle_id, user), &true);
+        
+        Ok(())
     }
 
 
