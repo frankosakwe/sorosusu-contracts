@@ -19,6 +19,9 @@ pub mod aggregate_credit;
 pub mod reliability_oracle;
 // Issue #418 & #409: Contribution Security and Merkle Proof Generator
 pub mod contribution_security;
+// Issue #XXX: RI Formal Verification - Mathematical proof of Trust-Positive invariants
+#[cfg(test)]
+mod ri_formal_verification_fuzz;
 
 #[cfg(test)]
 mod contribution_security_tests;
