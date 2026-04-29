@@ -87,6 +87,18 @@ pub enum DataKey {
     RoundFinalizationChecksum(u64), // CircleID -> RoundFinalizationChecksum
     PayoutRecord(u64, u32), // CircleID, RoundNumber -> PayoutRecord
     PayoutOverlapDetection(u64), // CircleID -> PayoutOverlapDetection
+    // Issue #408: Late Fee Auto-Deduction from Future Payouts
+    LateFeeDebt(u64, Address), // CircleID, MemberAddress -> LateFeeDebt
+    PayoutDeduction(u64, Address), // CircleID, MemberAddress -> PayoutDeduction
+    // Issue #412: Contribution Velocity Metric for Member Reliability Index
+    ContributionVelocity(Address), // MemberAddress -> ContributionVelocity
+    VelocityHistory(Address, u64), // MemberAddress, Timestamp -> VelocityRecord
+    // Issue #384: Multi-Asset Matching Rewards (Liquidity Mining)
+    RewardDistributor, // Global reward distributor config
+    GroupTVL(u64), // CircleID -> Total Value Locked
+    RewardAccumulation(Address, u64), // MemberAddress, CircleID -> RewardAccumulation
+    RewardClaimHistory(Address, u64), // MemberAddress, ClaimID -> RewardClaim
+    WashStreamingProtection(Address, u64), // MemberAddress, CircleID -> Last participation timestamp
 }
 
 pub use liquidity_buffer::*;
@@ -98,6 +110,9 @@ pub use reputation_export::*;
 
 #[cfg(test)]
 mod reputation_export_tests;
+
+#[cfg(test)]
+mod late_fee_velocity_rewards_tests;
 
 /// 72 hours in seconds — the mandatory appeals window before slashed collateral
 /// can be redistributed to victims (Issue #324).
@@ -849,6 +864,45 @@ pub trait SoroSusuTrait {
 
     /// Get transaction state for debugging/admin purposes
     fn get_transaction_state(env: Env, tx_id: BytesN<32>) -> Option<contribution_security::TransactionState>;
+
+    // --- ISSUE #408: LATE FEE AUTO-DEDUCTION FROM FUTURE PAYOUTS ---
+
+    /// Enable/disable late fee auto-deduction for a member
+    fn configure_auto_deduction(env: Env, admin: Address, circle_id: u64, member: Address, enabled: bool);
+
+    /// Get late fee debt for a member
+    fn get_late_fee_debt(env: Env, circle_id: u64, member: Address) -> LateFeeDebt;
+
+    /// Process payout with late fee deductions
+    fn process_payout_with_deductions(env: Env, circle_id: u64, member: Address, original_payout: i128) -> i128;
+
+    // --- ISSUE #412: CONTRIBUTION VELOCITY METRIC ---
+
+    /// Get contribution velocity metrics for a member
+    fn get_contribution_velocity(env: Env, member: Address) -> ContributionVelocity;
+
+    /// Update contribution velocity after a payment
+    fn update_contribution_velocity(env: Env, member: Address, circle_id: u64, round: u32, payment_timestamp: u64, deadline: u64);
+
+    /// Get enhanced reliability index including velocity
+    fn get_enhanced_reliability_index(env: Env, member: Address) -> ReliabilityIndex;
+
+    // --- ISSUE #384: MULTI-ASSET MATCHING REWARDS (LIQUIDITY MINING) ---
+
+    /// Initialize reward distributor configuration
+    fn initialize_reward_distributor(env: Env, admin: Address, config: RewardDistributorConfig);
+
+    /// Update group TVL for reward calculations
+    fn update_group_tvl(env: Env, circle_id: u64);
+
+    /// Calculate rewards for a member
+    fn calculate_member_rewards(env: Env, member: Address, circle_id: u64) -> i128;
+
+    /// Claim accumulated rewards
+    fn claim_rewards(env: Env, member: Address, circle_id: u64) -> RewardClaim;
+
+    /// Get reward distributor configuration
+    fn get_reward_distributor_config(env: Env) -> RewardDistributorConfig;
 }
 
 // --- IMPLEMENTATION ---
@@ -1535,6 +1589,157 @@ pub struct ReputationData {
     pub social_capital: u32,    // 0-10000 bps
     pub last_updated: u64,
     pub is_active: bool,
+}
+
+// --- ISSUE #408: LATE FEE AUTO-DEDUCTION FROM FUTURE PAYOUTS ---
+
+/// Late Fee Debt - Tracks accumulated late fees for a member
+#[contracttype]
+#[derive(Clone)]
+pub struct LateFeeDebt {
+    pub member: Address,
+    pub circle_id: u64,
+    pub total_debt: i128,           // Total late fees owed
+    pub fee_history: Vec<LateFeeRecord>, // History of late fee assessments
+    pub auto_deduction_enabled: bool,   // Whether auto-deduction is enabled
+    pub created_at: u64,
+    pub last_updated: u64,
+}
+
+/// Individual Late Fee Record
+#[contracttype]
+#[derive(Clone)]
+pub struct LateFeeRecord {
+    pub round_number: u32,
+    pub fee_amount: i128,
+    pub original_amount: i128,      // Original contribution amount
+    pub late_timestamp: u64,
+    pub is_deducted: bool,          // Whether fee has been deducted from payout
+    pub deduction_round: Option<u32>, // Round where deduction occurred
+}
+
+/// Payout Deduction - Tracks deductions from member payouts
+#[contracttype]
+#[derive(Clone)]
+pub struct PayoutDeduction {
+    pub member: Address,
+    pub circle_id: u64,
+    pub total_deducted: i128,       // Total amount deducted from payouts
+    pub remaining_debt: i128,       // Remaining debt after deductions
+    pub deduction_history: Vec<DeductionRecord>,
+    pub last_deduction_round: u32,
+}
+
+/// Individual Deduction Record
+#[contracttype]
+#[derive(Clone)]
+pub struct DeductionRecord {
+    pub round_number: u32,
+    pub original_payout: i128,     // What the payout would have been
+    pub deducted_amount: i128,      // Amount deducted for late fees
+    pub final_payout: i128,        // Final payout after deduction
+    pub timestamp: u64,
+}
+
+// --- ISSUE #412: CONTRIBUTION VELOCITY METRIC ---
+
+/// Contribution Velocity - Tracks how quickly members make contributions
+#[contracttype]
+#[derive(Clone)]
+pub struct ContributionVelocity {
+    pub member: Address,
+    pub average_payment_speed: f64,    // Average hours before deadline
+    pub velocity_score: u32,            // 0-10000 bps velocity score
+    pub early_payment_ratio: u32,       // % of payments made >24h early
+    pub last_minute_ratio: u32,         // % of payments made <1h before deadline
+    pub consistency_score: u32,         // How consistent payment timing is
+    pub total_payments_analyzed: u32,
+    pub last_updated: u64,
+}
+
+/// Velocity History Record - Individual payment timing data
+#[contracttype]
+#[derive(Clone)]
+pub struct VelocityRecord {
+    pub member: Address,
+    pub circle_id: u64,
+    pub round_number: u32,
+    pub payment_timestamp: u64,
+    pub deadline_timestamp: u64,
+    pub hours_before_deadline: f64,     // How early/late the payment was
+    pub is_early: bool,                 // Payment was made before deadline
+    pub velocity_impact: i32,           // Impact on velocity score
+}
+
+// --- ISSUE #384: MULTI-ASSET MATCHING REWARDS (LIQUIDITY MINING) ---
+
+/// Reward Distributor Configuration
+#[contracttype]
+#[derive(Clone)]
+pub struct RewardDistributorConfig {
+    pub is_enabled: bool,
+    pub governance_token: Address,      // Token used for rewards
+    pub match_rate_bps: u32,             // Matching rate (e.g., 1000 = 10%)
+    pub min_ri_threshold: u32,           // Minimum RI for eligibility (e.g., 5000 = 50%)
+    pub min_cycle_duration: u64,        // Minimum cycle duration (3 months in seconds)
+    pub max_reward_per_user: i128,       // Maximum reward per user per cycle
+    pub total_reward_pool: i128,         // Total rewards available
+    pub reward_pool_remaining: i128,     // Remaining rewards in pool
+    pub wash_streaming_penalty: u32,     // Penalty for rapid cycling (bps)
+    pub last_distribution: u64,
+}
+
+/// Group TVL Tracking - Total Value Locked per circle
+#[contracttype]
+#[derive(Clone)]
+pub struct GroupTVL {
+    pub circle_id: u64,
+    pub total_tvl: i128,                 // Total value locked in the group
+    pub member_contributions: i128,      // Total member contributions
+    pub yield_earned: i128,              // Total yield generated
+    pub last_updated: u64,
+    pub eligible_members: u32,           // Members eligible for rewards
+}
+
+/// Reward Accumulation - Tracks earned rewards for a member in a circle
+#[contracttype]
+#[derive(Clone)]
+pub struct RewardAccumulation {
+    pub member: Address,
+    pub circle_id: u64,
+    pub contribution_volume: i128,       // Total contribution volume
+    pub reliability_weight: u32,         // Weight based on RI
+    pub earned_rewards: i128,            // Total rewards earned
+    pub claimed_rewards: i128,           // Total rewards already claimed
+    pub eligibility_start: u64,           // When member became eligible
+    pub last_calculated: u64,
+}
+
+/// Reward Claim History - Track individual reward claims
+#[contracttype]
+#[derive(Clone)]
+pub struct RewardClaim {
+    pub claim_id: u64,
+    pub member: Address,
+    pub circle_id: u64,
+    pub amount_claimed: i128,
+    pub contribution_volume: i128,
+    pub reliability_score: u32,
+    pub claim_timestamp: u64,
+    pub is_final_claim: bool,           // True if this is the final claim for the cycle
+}
+
+/// Wash Streaming Protection - Prevent rapid cycling for rewards farming
+#[contracttype]
+#[derive(Clone)]
+pub struct WashStreamingProtection {
+    pub member: Address,
+    pub circle_id: u64,
+    pub first_join_timestamp: u64,
+    pub last_exit_timestamp: Option<u64>,
+    pub cycle_count: u32,                // Number of cycles participated
+    pub is_protected: bool,              // Whether protection is active
+    pub penalty_applied: u32,             // Penalty applied (bps)
 }
 
 
@@ -2486,6 +2691,16 @@ impl SoroSusuTrait for SoroSusu {
             .checked_shl(member_mut.index)
             .unwrap_or_else(|| panic!("Member index overflow"));
         circle_mut.contribution_bitmap |= contribution_bit;
+
+        // Update contribution velocity for on-time payment
+        Self::update_contribution_velocity(
+            env.clone(),
+            user.clone(),
+            circle_id,
+            circle_mut.current_recipient_index,
+            current_time,
+            circle_mut.deadline_timestamp,
+        );
 
         // Update storage
         env.storage().instance().set(&member_key, &member_mut);
@@ -4120,7 +4335,35 @@ impl SoroSusuTrait for SoroSusu {
             .instance()
             .set(&DataKey::Circle(circle_id), &circle);
 
-        // 13. Mark as Paid in the old format for backward compatibility
+        // 13. Update contribution velocity metrics
+        Self::update_contribution_velocity(
+            env.clone(),
+            user.clone(),
+            circle_id,
+            circle.current_recipient_index,
+            current_time,
+            circle.deadline_timestamp,
+        );
+
+        // 14. Update late fee debt tracking for auto-deduction
+        let mut debt: LateFeeDebt = Self::get_late_fee_debt(env.clone(), circle_id, user.clone());
+        
+        let fee_record = LateFeeRecord {
+            round_number: circle.current_recipient_index,
+            fee_amount: late_fee as i128,
+            original_amount: circle.contribution_amount as i128,
+            late_timestamp: current_time,
+            is_deducted: false,
+            deduction_round: None,
+        };
+        
+        debt.fee_history.push_back(fee_record);
+        debt.total_debt += late_fee as i128;
+        debt.last_updated = current_time;
+        
+        env.storage().instance().set(&DataKey::LateFeeDebt(circle_id, user), &debt);
+
+        // 15. Mark as Paid in the old format for backward compatibility
         env.storage()
             .instance()
             .set(&DataKey::Deposit(circle_id, user), &true);
@@ -4969,13 +5212,21 @@ impl SoroSusuTrait for SoroSusu {
             panic!("unauthorized");
         }
 
-        let payout_amount = (circle.contribution_amount as i128)
+        let original_payout_amount = (circle.contribution_amount as i128)
             .checked_mul(circle.member_count as i128)
             .expect("payout overflow");
 
         // Get current recipient (simplified - in production, resolve from payout queue)
         // For now, we'll use the circle creator as the recipient
         let recipient = circle.creator.clone();
+
+        // Process late fee auto-deduction
+        let final_payout_amount = Self::process_payout_with_deductions(
+            env.clone(),
+            circle_id,
+            recipient.clone(),
+            original_payout_amount,
+        );
 
         // Check user's payout preference
         let user_preference = Self::get_payout_preference(env.clone(), recipient.clone(), circle_id);
@@ -5007,7 +5258,7 @@ impl SoroSusuTrait for SoroSusu {
                 token.transfer(
                     &env.current_contract_address(),
                     &recipient,
-                    &payout_amount,
+                    &final_payout_amount,
                 );
             }
             PayoutMethod::DirectToBank => {
@@ -5019,7 +5270,7 @@ impl SoroSusuTrait for SoroSusu {
                         anchor_config.preferred_anchor,
                         recipient.clone(),
                         circle_id,
-                        payout_amount as u64,
+                        final_payout_amount as u64,
                         circle.token.clone(),
                     ) {
                         Ok(deposit_id) => {
@@ -6053,6 +6304,342 @@ impl SoroSusuTrait for SoroSusu {
     fn get_transaction_state(env: Env, tx_id: BytesN<32>) -> Option<contribution_security::TransactionState> {
         contribution_security::ContributionSecurityTrait::get_transaction_state(env, tx_id)
     }
+
+    // --- ISSUE #408: LATE FEE AUTO-DEDUCTION FROM FUTURE PAYOUTS ---
+
+    fn configure_auto_deduction(env: Env, admin: Address, circle_id: u64, member: Address, enabled: bool) {
+        require_admin(&env, &admin);
+        
+        let mut debt: LateFeeDebt = env.storage().instance()
+            .get(&DataKey::LateFeeDebt(circle_id, member.clone()))
+            .unwrap_or_else(|| LateFeeDebt {
+                member: member.clone(),
+                circle_id,
+                total_debt: 0,
+                fee_history: Vec::new(&env),
+                auto_deduction_enabled: false,
+                created_at: env.ledger().timestamp(),
+                last_updated: env.ledger().timestamp(),
+            });
+        
+        debt.auto_deduction_enabled = enabled;
+        debt.last_updated = env.ledger().timestamp();
+        
+        env.storage().instance().set(&DataKey::LateFeeDebt(circle_id, member), &debt);
+    }
+
+    fn get_late_fee_debt(env: Env, circle_id: u64, member: Address) -> LateFeeDebt {
+        env.storage().instance()
+            .get(&DataKey::LateFeeDebt(circle_id, member))
+            .unwrap_or_else(|| LateFeeDebt {
+                member,
+                circle_id,
+                total_debt: 0,
+                fee_history: Vec::new(&env),
+                auto_deduction_enabled: false,
+                created_at: env.ledger().timestamp(),
+                last_updated: env.ledger().timestamp(),
+            })
+    }
+
+    fn process_payout_with_deductions(env: Env, circle_id: u64, member: Address, original_payout: i128) -> i128 {
+        let debt: LateFeeDebt = Self::get_late_fee_debt(env.clone(), circle_id, member.clone());
+        
+        if !debt.auto_deduction_enabled || debt.total_debt == 0 {
+            return original_payout;
+        }
+
+        let deduction_amount = std::cmp::min(debt.total_debt, original_payout);
+        let final_payout = original_payout - deduction_amount;
+
+        // Update payout deduction tracking
+        let mut deduction: PayoutDeduction = env.storage().instance()
+            .get(&DataKey::PayoutDeduction(circle_id, member.clone()))
+            .unwrap_or_else(|| PayoutDeduction {
+                member: member.clone(),
+                circle_id,
+                total_deducted: 0,
+                remaining_debt: debt.total_debt,
+                deduction_history: Vec::new(&env),
+                last_deduction_round: 0,
+            });
+
+        let deduction_record = DeductionRecord {
+            round_number: 0, // This would be set based on current round
+            original_payout,
+            deducted_amount: deduction_amount,
+            final_payout,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        deduction.deduction_history.push_back(deduction_record);
+        deduction.total_deducted += deduction_amount;
+        deduction.remaining_debt = debt.total_debt - deduction.total_deducted;
+        deduction.last_deduction_round = 0; // Set based on current round
+
+        env.storage().instance().set(&DataKey::PayoutDeduction(circle_id, member), &deduction);
+
+        final_payout
+    }
+
+    // --- ISSUE #412: CONTRIBUTION VELOCITY METRIC ---
+
+    fn get_contribution_velocity(env: Env, member: Address) -> ContributionVelocity {
+        env.storage().instance()
+            .get(&DataKey::ContributionVelocity(member))
+            .unwrap_or_else(|| ContributionVelocity {
+                member: member.clone(),
+                average_payment_speed: 0.0,
+                velocity_score: 5000, // Default 50%
+                early_payment_ratio: 0,
+                last_minute_ratio: 0,
+                consistency_score: 5000, // Default 50%
+                total_payments_analyzed: 0,
+                last_updated: env.ledger().timestamp(),
+            })
+    }
+
+    fn update_contribution_velocity(env: Env, member: Address, circle_id: u64, round: u32, payment_timestamp: u64, deadline: u64) {
+        let mut velocity: ContributionVelocity = Self::get_contribution_velocity(env.clone(), member.clone());
+        
+        let hours_before_deadline = if payment_timestamp <= deadline {
+            (deadline - payment_timestamp) as f64 / 3600.0
+        } else {
+            -((payment_timestamp - deadline) as f64 / 3600.0)
+        };
+
+        let is_early = payment_timestamp <= deadline;
+        
+        // Create velocity record
+        let record = VelocityRecord {
+            member: member.clone(),
+            circle_id,
+            round_number: round,
+            payment_timestamp,
+            deadline_timestamp: deadline,
+            hours_before_deadline,
+            is_early,
+            velocity_impact: 0, // Calculate based on timing
+        };
+
+        // Store in history
+        let history_key = DataKey::VelocityHistory(member.clone(), payment_timestamp);
+        env.storage().instance().set(&history_key, &record);
+
+        // Update velocity metrics
+        velocity.total_payments_analyzed += 1;
+        
+        if is_early {
+            if hours_before_deadline >= 24.0 {
+                velocity.early_payment_ratio = ((velocity.early_payment_ratio as u64 * (velocity.total_payments_analyzed - 1) + 10000) / velocity.total_payments_analyzed as u64) as u32;
+            } else if hours_before_deadline < 1.0 {
+                velocity.last_minute_ratio = ((velocity.last_minute_ratio as u64 * (velocity.total_payments_analyzed - 1) + 10000) / velocity.total_payments_analyzed as u64) as u32;
+            }
+        }
+
+        // Update average payment speed
+        let old_total = velocity.average_payment_speed * (velocity.total_payments_analyzed - 1) as f64;
+        velocity.average_payment_speed = (old_total + hours_before_deadline) / velocity.total_payments_analyzed as f64;
+
+        // Calculate velocity score (0-10000 bps)
+        // Higher score for consistent early payments
+        let early_bonus = if velocity.early_payment_ratio > 7000 { 2000 } else { 0 };
+        let consistency_bonus = if velocity.consistency_score > 7000 { 1500 } else { 0 };
+        let timing_score = if hours_before_deadline >= 12.0 { 2500 } else if hours_before_deadline >= 1.0 { 1500 } else { 500 };
+        
+        velocity.velocity_score = (early_bonus + consistency_bonus + timing_score).min(10000);
+        velocity.last_updated = env.ledger().timestamp();
+
+        env.storage().instance().set(&DataKey::ContributionVelocity(member), &velocity);
+    }
+
+    fn get_enhanced_reliability_index(env: Env, member: Address) -> ReliabilityIndex {
+        let mut ri: ReliabilityIndex = Self::get_reliability_index(env.clone(), member.clone());
+        let velocity: ContributionVelocity = Self::get_contribution_velocity(env.clone(), member.clone());
+        
+        // Enhance RI score with velocity metrics
+        let velocity_bonus = (velocity.velocity_score as u32 * 10) / 100; // 10% weight
+        let consistency_bonus = (velocity.consistency_score as u32 * 5) / 100; // 5% weight
+        
+        ri.score = (ri.score + velocity_bonus + consistency_bonus).min(1000);
+        ri.last_updated = env.ledger().timestamp();
+        
+        env.storage().instance().set(&DataKey::ReliabilityIndex(member), &ri);
+        ri
+    }
+
+    // --- ISSUE #384: MULTI-ASSET MATCHING REWARDS (LIQUIDITY MINING) ---
+
+    fn initialize_reward_distributor(env: Env, admin: Address, config: RewardDistributorConfig) {
+        require_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::RewardDistributor, &config);
+    }
+
+    fn update_group_tvl(env: Env, circle_id: u64) {
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        let member_count = circle.member_count;
+        let contribution_amount = circle.contribution_amount;
+        
+        let total_tvl = contribution_amount * member_count as i128;
+        
+        let mut group_tvl: GroupTVL = env.storage().instance()
+            .get(&DataKey::GroupTVL(circle_id))
+            .unwrap_or_else(|| GroupTVL {
+                circle_id,
+                total_tvl: 0,
+                member_contributions: 0,
+                yield_earned: 0,
+                last_updated: env.ledger().timestamp(),
+                eligible_members: 0,
+            });
+
+        group_tvl.total_tvl = total_tvl;
+        group_tvl.member_contributions = total_tvl;
+        group_tvl.last_updated = env.ledger().timestamp();
+        
+        // Count eligible members (RI > 5000)
+        let mut eligible_count = 0;
+        for member_addr in circle.member_addresses.iter() {
+            let ri = Self::get_enhanced_reliability_index(env.clone(), member_addr);
+            if ri.score >= 500 { // Convert to 0-1000 scale
+                eligible_count += 1;
+            }
+        }
+        group_tvl.eligible_members = eligible_count;
+
+        env.storage().instance().set(&DataKey::GroupTVL(circle_id), &group_tvl);
+    }
+
+    fn calculate_member_rewards(env: Env, member: Address, circle_id: u64) -> i128 {
+        let config: RewardDistributorConfig = env.storage().instance()
+            .get(&DataKey::RewardDistributor)
+            .unwrap_or_else(|| panic!("Reward distributor not initialized"));
+
+        if !config.is_enabled {
+            return 0;
+        }
+
+        let ri = Self::get_enhanced_reliability_index(env.clone(), member.clone());
+        let ri_score_bps = (ri.score * 10000) / 1000; // Convert to bps
+
+        if ri_score_bps < config.min_ri_threshold {
+            return 0;
+        }
+
+        let group_tvl: GroupTVL = env.storage().instance()
+            .get(&DataKey::GroupTVL(circle_id))
+            .unwrap_or_else(|| GroupTVL {
+                circle_id,
+                total_tvl: 0,
+                member_contributions: 0,
+                yield_earned: 0,
+                last_updated: env.ledger().timestamp(),
+                eligible_members: 0,
+            });
+
+        let mut accumulation: RewardAccumulation = env.storage().instance()
+            .get(&DataKey::RewardAccumulation(member.clone(), circle_id))
+            .unwrap_or_else(|| RewardAccumulation {
+                member: member.clone(),
+                circle_id,
+                contribution_volume: 0,
+                reliability_weight: ri_score_bps,
+                earned_rewards: 0,
+                claimed_rewards: 0,
+                eligibility_start: env.ledger().timestamp(),
+                last_calculated: env.ledger().timestamp(),
+            });
+
+        // Calculate pro-rata rewards based on contribution volume and reliability
+        let member_share = if group_tvl.member_contributions > 0 {
+            (accumulation.contribution_volume * 10000) / group_tvl.member_contributions
+        } else {
+            0
+        };
+
+        let reliability_multiplier = (ri_score_bps * config.match_rate_bps) / 10000;
+        let potential_reward = (group_tvl.total_tvl * reliability_multiplier) / 10000;
+        let member_reward = (potential_reward * member_share) / 10000;
+
+        // Apply wash streaming protection
+        let protection: WashStreamingProtection = env.storage().instance()
+            .get(&DataKey::WashStreamingProtection(member.clone(), circle_id))
+            .unwrap_or_else(|| WashStreamingProtection {
+                member: member.clone(),
+                circle_id,
+                first_join_timestamp: env.ledger().timestamp(),
+                last_exit_timestamp: None,
+                cycle_count: 1,
+                is_protected: false,
+                penalty_applied: 0,
+            });
+
+        let final_reward = if protection.is_protected && protection.penalty_applied > 0 {
+            (member_reward * (10000 - protection.penalty_applied)) / 10000
+        } else {
+            member_reward
+        };
+
+        accumulation.earned_rewards += final_reward;
+        accumulation.last_calculated = env.ledger().timestamp();
+
+        env.storage().instance().set(&DataKey::RewardAccumulation(member, circle_id), &accumulation);
+
+        final_reward.min(config.max_reward_per_user)
+    }
+
+    fn claim_rewards(env: Env, member: Address, circle_id: u64) -> RewardClaim {
+        let accumulation: RewardAccumulation = env.storage().instance()
+            .get(&DataKey::RewardAccumulation(member.clone(), circle_id))
+            .unwrap_or_else(|| panic!("No rewards to claim"));
+
+        let available_rewards = accumulation.earned_rewards - accumulation.claimed_rewards;
+        if available_rewards <= 0 {
+            panic!("No available rewards to claim");
+        }
+
+        let claim_id = env.ledger().sequence();
+        let claim = RewardClaim {
+            claim_id,
+            member: member.clone(),
+            circle_id,
+            amount_claimed: available_rewards,
+            contribution_volume: accumulation.contribution_volume,
+            reliability_score: accumulation.reliability_weight,
+            claim_timestamp: env.ledger().timestamp(),
+            is_final_claim: false,
+        };
+
+        // Update accumulation
+        let mut updated_accumulation = accumulation;
+        updated_accumulation.claimed_rewards += available_rewards;
+        env.storage().instance().set(&DataKey::RewardAccumulation(member, circle_id), &updated_accumulation);
+
+        // Store claim history
+        env.storage().instance().set(&DataKey::RewardClaimHistory(member, claim_id), &claim);
+
+        claim
+    }
+
+    fn get_reward_distributor_config(env: Env) -> RewardDistributorConfig {
+        env.storage().instance()
+            .get(&DataKey::RewardDistributor)
+            .unwrap_or_else(|| RewardDistributorConfig {
+                is_enabled: false,
+                governance_token: Address::generate(&env),
+                match_rate_bps: 0,
+                min_ri_threshold: 5000,
+                min_cycle_duration: 90 * 24 * 60 * 60, // 3 months
+                max_reward_per_user: 0,
+                total_reward_pool: 0,
+                reward_pool_remaining: 0,
+                wash_streaming_penalty: 5000, // 50% penalty
+                last_distribution: 0,
+            })
+    }
 }
 
 // --- HELPER FUNCTIONS ---
@@ -6101,6 +6688,16 @@ fn require_not_paused(env: &Env) {
         .unwrap_or(false);
     if paused {
         panic!("contract is paused");
+    }
+}
+
+/// Helper: Require admin authorization
+fn require_admin(env: &Env, admin: &Address) {
+    let stored_admin: Address = env.storage().instance()
+        .get(&DataKey::Admin)
+        .unwrap();
+    if stored_admin != *admin {
+        panic!("Unauthorized");
     }
 }
 
