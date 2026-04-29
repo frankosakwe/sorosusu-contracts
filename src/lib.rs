@@ -17,6 +17,9 @@ pub mod passkey_auth;
 pub mod aggregate_credit;
 // Reputation-as-a-Service adapter for partner protocol VIP gates.
 pub mod reliability_oracle;
+// Issue #339: Vault balance invariant helpers for concurrent-payout fuzz tests.
+#[cfg(test)]
+pub mod vault_balance_invariant;
 
 // Issue #321: Maximum cycle duration cap (2 years in seconds) to prevent
 // integer overflow exploits and unbounded storage accumulation.
