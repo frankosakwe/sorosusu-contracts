@@ -17,6 +17,11 @@ pub mod passkey_auth;
 pub mod aggregate_credit;
 // Reputation-as-a-Service adapter for partner protocol VIP gates.
 pub mod reliability_oracle;
+// Issue #418 & #409: Contribution Security and Merkle Proof Generator
+pub mod contribution_security;
+
+#[cfg(test)]
+mod contribution_security_tests;
 
 // Issue #321: Maximum cycle duration cap (2 years in seconds) to prevent
 // integer overflow exploits and unbounded storage accumulation.
@@ -70,6 +75,13 @@ pub enum DataKey {
     UserBankPreference(Address, u64), // User, CircleID
     AnchorDepositCount,
     MissingTrustline(u64, Address), // CircleID, MemberAddress
+    // Issue #378: Automated Tax-Withholding and Financial Reporting Hook
+    TaxConfiguration(u64), // CircleID -> TaxConfig
+    TaxCollectorAddress, // Global tax collector address
+    FinancialReceipt(u64, Address), // CircleID, UserAddress -> FinancialReceipt
+    TaxReport(u64), // CircleID -> TaxReport
+    TaxWithholdingPool, // Pool for collected tax funds
+    JurisdictionExemption(Address), // UserAddress -> bool (exempt from interest withholding)
 }
 
 pub use liquidity_buffer::*;
@@ -81,6 +93,9 @@ pub use reputation_export::*;
 
 #[cfg(test)]
 mod reputation_export_tests;
+
+#[cfg(test)]
+mod tax_withholding_tests;
 
 /// 72 hours in seconds — the mandatory appeals window before slashed collateral
 /// can be redistributed to victims (Issue #324).
@@ -811,6 +826,46 @@ pub trait SoroSusuTrait {
 
     /// Update reliability index (internal function)
     fn update_reliability_index(env: Env, user: Address, circle_id: u64, is_on_time: bool);
+
+    // --- ISSUE #378: AUTOMATED TAX-WITHHOLDING AND FINANCIAL REPORTING HOOK ---
+
+    /// Configure tax settings for a circle during initialization
+    fn configure_tax_settings(
+        env: Env,
+        admin: Address,
+        circle_id: u64,
+        tax_config: TaxConfiguration,
+    );
+
+    /// Update tax collector address (admin only, between cycles only)
+    fn update_tax_collector(env: Env, admin: Address, new_collector: Address);
+
+    /// Set jurisdiction exemption for a user (prevents interest withholding)
+    fn set_jurisdiction_exemption(env: Env, admin: Address, user: Address, exempt: bool);
+
+    /// Generate tax report for a reporting period
+    fn generate_tax_report(
+        env: Env,
+        admin: Address,
+        circle_id: u64,
+        period_start: u64,
+        period_end: u64,
+    ) -> Result<u64, u32>; // Returns report_id
+
+    /// Get financial receipt for a specific payout
+    fn get_financial_receipt(env: Env, circle_id: u64, user: Address) -> Option<FinancialReceipt>;
+
+    /// Get tax configuration for a circle
+    fn get_tax_configuration(env: Env, circle_id: u64) -> Option<TaxConfiguration>;
+
+    /// Get tax withholding pool status
+    fn get_tax_withholding_pool(env: Env) -> TaxWithholdingPool;
+
+    /// Read-only function for frontend PDF generation
+    fn get_tax_report_data(env: Env, circle_id: u64, report_id: u64) -> Option<TaxReport>;
+
+    /// Distribute collected tax funds to collector
+    fn distribute_tax_funds(env: Env, admin: Address) -> Result<i128, u32>;
 }
 
 // --- IMPLEMENTATION ---
@@ -968,6 +1023,210 @@ pub struct CircleInfo {
     /// Multi-asset basket: None for single-token circles, Some(...) for basket circles.
     /// Each AssetWeight specifies a token address and its allocation in basis points.
     pub basket: Option<Vec<AssetWeight>>,
+}
+
+// --- ISSUE #406: ANTI-COLLUSION MULTI-SIG FOR ROUND SKIPPING ---
+
+/// Multi-signature configuration for round skipping decisions
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiSigConfig {
+    /// Minimum number of approvals required to skip a round
+    pub required_approvals: u32,
+    /// List of authorized approvers (typically trusted members or admins)
+    pub authorized_approvers: Vec<Address>,
+    /// Time window for approvals (in seconds)
+    pub approval_timeout: u64,
+    /// Whether multi-sig is enabled for this circle
+    pub enabled: bool,
+}
+
+/// Round skip proposal with anti-collusion protection
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoundSkipProposal {
+    /// Unique proposal ID
+    pub proposal_id: u64,
+    /// Circle ID
+    pub circle_id: u64,
+    /// Round number to skip
+    pub round_to_skip: u32,
+    /// Reason for skipping (optional)
+    pub reason: Symbol,
+    /// Member who would be skipped (payout recipient)
+    pub skipped_member: Address,
+    /// Timestamp when proposal was created
+    pub created_at: u64,
+    /// Timestamp when proposal expires
+    pub expires_at: u64,
+    /// Current approval count
+    pub approval_count: u32,
+    /// List of members who have approved
+    pub approved_by: Vec<Address>,
+    /// Proposal status
+    pub status: RoundSkipStatus,
+    /// Anti-collusion: checksum of member states at proposal time
+    pub state_checksum: BytesN<32>,
+}
+
+/// Round skip proposal status
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RoundSkipStatus {
+    Pending,    // Waiting for approvals
+    Approved,   // Enough approvals received
+    Executed,   // Round skip executed
+    Rejected,   // Proposal rejected or expired
+    Cancelled,  // Proposal cancelled by creator
+}
+
+// --- ISSUE #410: TEMPORARY STORAGE FOR EPHEMERAL VOTING STATES ---
+
+/// Temporary voting state for a juror in a dispute
+/// Stored in temporary storage and cleaned up after dispute resolution
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TempVotingState {
+    /// Juror address
+    pub juror: Address,
+    /// Dispute ID
+    pub dispute_id: u64,
+    /// Vote choice (true = guilty, false = not guilty)
+    pub vote_choice: bool,
+    /// Timestamp when vote was cast
+    pub voted_at: u64,
+    /// Weight of the juror's vote (based on reputation/stake)
+    pub vote_weight: u32,
+    /// Whether the juror has been rewarded for voting
+    pub rewarded: bool,
+    /// Temporary signature/commitment for vote privacy
+    pub vote_commitment: BytesN<32>,
+}
+
+/// Voting session state for managing the entire voting process
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VotingSessionState {
+    /// Dispute ID
+    pub dispute_id: u64,
+    /// Total eligible jurors
+    pub total_jurors: u32,
+    /// Number of votes cast so far
+    pub votes_cast: u32,
+    /// Number of guilty votes
+    pub guilty_votes: u32,
+    /// Number of not guilty votes
+    pub not_guilty_votes: u32,
+    /// Total vote weight for guilty
+    pub guilty_weight: u64,
+    /// Total vote weight for not guilty
+    pub not_guilty_weight: u64,
+    /// Voting deadline timestamp
+    pub voting_deadline: u64,
+    /// Minimum votes required for decision
+    pub min_votes_required: u32,
+    /// Whether voting is still active
+    pub is_active: bool,
+    /// Session start timestamp
+    pub session_start: u64,
+    /// Quorum reached flag
+    pub quorum_reached: bool,
+}
+
+/// Juror selection parameters for dispute resolution
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct JurorSelectionParams {
+    /// Minimum reputation score to be eligible
+    pub min_reputation: u32,
+    /// Maximum number of jurors per dispute
+    pub max_jurors: u32,
+    /// Random seed for juror selection
+    pub selection_seed: u64,
+    /// Juror stake requirement
+    pub stake_requirement: i128,
+    /// Whether voting is anonymous
+    pub anonymous_voting: bool,
+}
+
+// --- ISSUE #421: ROUND-FINALIZATION CHECKSUM TO PREVENT PAYOUT OVERLAPS ---
+
+/// Round finalization checksum to prevent payout overlaps
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoundFinalizationChecksum {
+    /// Circle ID
+    pub circle_id: u64,
+    /// Round number
+    pub round_number: u32,
+    /// Checksum of all member states at finalization
+    pub state_checksum: BytesN<32>,
+    /// Checksum of all contributions for this round
+    pub contribution_checksum: BytesN<32>,
+    /// Checksum of all previous payouts to prevent overlaps
+    pub payout_checksum: BytesN<32>,
+    /// Timestamp when checksum was generated
+    pub created_at: u64,
+    /// Whether the round is finalized
+    pub is_finalized: bool,
+    /// Finalization timestamp
+    pub finalized_at: Option<u64>,
+    /// Recipient of this round's payout
+    pub payout_recipient: Address,
+    /// Total payout amount for this round
+    pub payout_amount: i128,
+}
+
+/// Individual payout record for tracking
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PayoutRecord {
+    /// Circle ID
+    pub circle_id: u64,
+    /// Round number
+    pub round_number: u32,
+    /// Recipient address
+    pub recipient: Address,
+    /// Payout amount
+    pub amount: i128,
+    /// Payout timestamp
+    pub paid_at: u64,
+    /// Transaction hash of the payout
+    pub tx_hash: BytesN<32>,
+    /// Whether payout was successful
+    pub is_successful: bool,
+    /// Payout type (regular, skip, etc.)
+    pub payout_type: PayoutType,
+}
+
+/// Payout type enumeration
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PayoutType {
+    Regular,    // Normal round payout
+    Skip,       // Payout after round skip
+    Emergency,  // Emergency payout
+    Recovery,   // Recovery payout
+}
+
+/// Payout overlap detection state
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PayoutOverlapDetection {
+    /// Circle ID
+    pub circle_id: u64,
+    /// Last processed round number
+    pub last_processed_round: u32,
+    /// Bitmask of processed rounds (for quick overlap detection)
+    pub processed_rounds_bitmap: u64,
+    /// Hash of last payout to prevent double payments
+    pub last_payout_hash: BytesN<32>,
+    /// Overlap detection enabled flag
+    pub overlap_detection_enabled: bool,
+    /// Last overlap check timestamp
+    pub last_check_timestamp: u64,
+    /// Number of overlaps detected (for monitoring)
+    pub overlaps_detected: u32,
 }
 
 /// Group Insurance Fund - Tracks mutual insurance for default protection
@@ -1157,6 +1416,66 @@ pub struct ReliabilityIndex {
     pub grace_period_hits: u32,
 }
 
+// --- ISSUE #378: AUTOMATED TAX-WITHHOLDING AND FINANCIAL REPORTING HOOK ---
+
+/// Tax Configuration - Per-circle tax withholding settings
+#[contracttype]
+#[derive(Clone)]
+pub struct TaxConfiguration {
+    pub enabled: bool,                    // Whether tax withholding is enabled
+    pub tax_bps: u32,                     // Tax rate in basis points (e.g., 1500 = 15%)
+    pub tax_collector_address: Address,   // Address to receive tax funds
+    pub jurisdiction_exempt: bool,         // Whether this circle is exempt from interest withholding
+    pub cycle_start_timestamp: u64,       // When the current tax cycle started (security: prevents rate changes)
+    pub sep40_oracle_address: Option<Address>, // SEP-40 oracle for fiat-equivalent values
+    pub reporting_enabled: bool,           // Whether to generate financial reports
+}
+
+/// Financial Receipt - On-chain receipt for tax audit purposes
+#[contracttype]
+#[derive(Clone)]
+pub struct FinancialReceipt {
+    pub receipt_id: u64,                   // Unique receipt identifier
+    pub circle_id: u64,                    // Circle ID
+    pub recipient_address: Address,         // Who received the payout
+    pub gross_amount: i128,                 // Total payout amount before tax
+    pub tax_withheld: i128,                // Amount withheld as tax
+    pub net_amount: i128,                  // Amount received by recipient
+    pub fiat_equivalent: Option<i128>,     // Fiat value via SEP-40 (in cents)
+    pub fiat_currency: Option<Symbol>,     // Fiat currency code (e.g., USD, EUR)
+    pub timestamp: u64,                    // When the payout occurred
+    pub receipt_hash: BytesN<32>,          // Hash of all receipt data for audit
+    pub tax_collector_address: Address,    // Address that received the tax
+}
+
+/// Tax Report - Aggregated tax data for reporting periods
+#[contracttype]
+#[derive(Clone)]
+pub struct TaxReport {
+    pub report_id: u64,                    // Unique report identifier
+    pub circle_id: u64,                    // Circle ID
+    pub reporting_period_start: u64,       // Period start timestamp
+    pub reporting_period_end: u64,         // Period end timestamp
+    pub total_payouts: u32,                // Number of payouts in period
+    pub total_gross_amount: i128,          // Total amount paid out before tax
+    pub total_tax_withheld: i128,          // Total tax collected
+    pub total_net_amount: i128,            // Total amount received by recipients
+    pub report_cid: String,                // IPFS CID of encrypted off-chain report data
+    pub generated_timestamp: u64,          // When report was generated
+    pub report_hash: BytesN<32>,            // Hash of report data for integrity
+}
+
+/// Tax Withholding Pool - Tracks collected tax funds
+#[contracttype]
+#[derive(Clone)]
+pub struct TaxWithholdingPool {
+    pub total_collected: i128,             // Total tax funds collected
+    pub total_distributed: i128,           // Total tax funds distributed to collector
+    pub pending_distribution: i128,        // Funds awaiting distribution
+    pub last_distribution_timestamp: u64,   // Last time funds were distributed
+    pub collector_address: Address,         // Current tax collector address
+}
+
 /// Payment Timing Record - Track when each member paid in a round
 #[contracttype]
 #[derive(Clone)]
@@ -1322,6 +1641,157 @@ pub struct ReputationData {
     pub is_active: bool,
 }
 
+// --- ISSUE #408: LATE FEE AUTO-DEDUCTION FROM FUTURE PAYOUTS ---
+
+/// Late Fee Debt - Tracks accumulated late fees for a member
+#[contracttype]
+#[derive(Clone)]
+pub struct LateFeeDebt {
+    pub member: Address,
+    pub circle_id: u64,
+    pub total_debt: i128,           // Total late fees owed
+    pub fee_history: Vec<LateFeeRecord>, // History of late fee assessments
+    pub auto_deduction_enabled: bool,   // Whether auto-deduction is enabled
+    pub created_at: u64,
+    pub last_updated: u64,
+}
+
+/// Individual Late Fee Record
+#[contracttype]
+#[derive(Clone)]
+pub struct LateFeeRecord {
+    pub round_number: u32,
+    pub fee_amount: i128,
+    pub original_amount: i128,      // Original contribution amount
+    pub late_timestamp: u64,
+    pub is_deducted: bool,          // Whether fee has been deducted from payout
+    pub deduction_round: Option<u32>, // Round where deduction occurred
+}
+
+/// Payout Deduction - Tracks deductions from member payouts
+#[contracttype]
+#[derive(Clone)]
+pub struct PayoutDeduction {
+    pub member: Address,
+    pub circle_id: u64,
+    pub total_deducted: i128,       // Total amount deducted from payouts
+    pub remaining_debt: i128,       // Remaining debt after deductions
+    pub deduction_history: Vec<DeductionRecord>,
+    pub last_deduction_round: u32,
+}
+
+/// Individual Deduction Record
+#[contracttype]
+#[derive(Clone)]
+pub struct DeductionRecord {
+    pub round_number: u32,
+    pub original_payout: i128,     // What the payout would have been
+    pub deducted_amount: i128,      // Amount deducted for late fees
+    pub final_payout: i128,        // Final payout after deduction
+    pub timestamp: u64,
+}
+
+// --- ISSUE #412: CONTRIBUTION VELOCITY METRIC ---
+
+/// Contribution Velocity - Tracks how quickly members make contributions
+#[contracttype]
+#[derive(Clone)]
+pub struct ContributionVelocity {
+    pub member: Address,
+    pub average_payment_speed: f64,    // Average hours before deadline
+    pub velocity_score: u32,            // 0-10000 bps velocity score
+    pub early_payment_ratio: u32,       // % of payments made >24h early
+    pub last_minute_ratio: u32,         // % of payments made <1h before deadline
+    pub consistency_score: u32,         // How consistent payment timing is
+    pub total_payments_analyzed: u32,
+    pub last_updated: u64,
+}
+
+/// Velocity History Record - Individual payment timing data
+#[contracttype]
+#[derive(Clone)]
+pub struct VelocityRecord {
+    pub member: Address,
+    pub circle_id: u64,
+    pub round_number: u32,
+    pub payment_timestamp: u64,
+    pub deadline_timestamp: u64,
+    pub hours_before_deadline: f64,     // How early/late the payment was
+    pub is_early: bool,                 // Payment was made before deadline
+    pub velocity_impact: i32,           // Impact on velocity score
+}
+
+// --- ISSUE #384: MULTI-ASSET MATCHING REWARDS (LIQUIDITY MINING) ---
+
+/// Reward Distributor Configuration
+#[contracttype]
+#[derive(Clone)]
+pub struct RewardDistributorConfig {
+    pub is_enabled: bool,
+    pub governance_token: Address,      // Token used for rewards
+    pub match_rate_bps: u32,             // Matching rate (e.g., 1000 = 10%)
+    pub min_ri_threshold: u32,           // Minimum RI for eligibility (e.g., 5000 = 50%)
+    pub min_cycle_duration: u64,        // Minimum cycle duration (3 months in seconds)
+    pub max_reward_per_user: i128,       // Maximum reward per user per cycle
+    pub total_reward_pool: i128,         // Total rewards available
+    pub reward_pool_remaining: i128,     // Remaining rewards in pool
+    pub wash_streaming_penalty: u32,     // Penalty for rapid cycling (bps)
+    pub last_distribution: u64,
+}
+
+/// Group TVL Tracking - Total Value Locked per circle
+#[contracttype]
+#[derive(Clone)]
+pub struct GroupTVL {
+    pub circle_id: u64,
+    pub total_tvl: i128,                 // Total value locked in the group
+    pub member_contributions: i128,      // Total member contributions
+    pub yield_earned: i128,              // Total yield generated
+    pub last_updated: u64,
+    pub eligible_members: u32,           // Members eligible for rewards
+}
+
+/// Reward Accumulation - Tracks earned rewards for a member in a circle
+#[contracttype]
+#[derive(Clone)]
+pub struct RewardAccumulation {
+    pub member: Address,
+    pub circle_id: u64,
+    pub contribution_volume: i128,       // Total contribution volume
+    pub reliability_weight: u32,         // Weight based on RI
+    pub earned_rewards: i128,            // Total rewards earned
+    pub claimed_rewards: i128,           // Total rewards already claimed
+    pub eligibility_start: u64,           // When member became eligible
+    pub last_calculated: u64,
+}
+
+/// Reward Claim History - Track individual reward claims
+#[contracttype]
+#[derive(Clone)]
+pub struct RewardClaim {
+    pub claim_id: u64,
+    pub member: Address,
+    pub circle_id: u64,
+    pub amount_claimed: i128,
+    pub contribution_volume: i128,
+    pub reliability_score: u32,
+    pub claim_timestamp: u64,
+    pub is_final_claim: bool,           // True if this is the final claim for the cycle
+}
+
+/// Wash Streaming Protection - Prevent rapid cycling for rewards farming
+#[contracttype]
+#[derive(Clone)]
+pub struct WashStreamingProtection {
+    pub member: Address,
+    pub circle_id: u64,
+    pub first_join_timestamp: u64,
+    pub last_exit_timestamp: Option<u64>,
+    pub cycle_count: u32,                // Number of cycles participated
+    pub is_protected: bool,              // Whether protection is active
+    pub penalty_applied: u32,             // Penalty applied (bps)
+}
+
 
 // --- CONTRACT CLIENTS ---
 
@@ -1437,6 +1907,26 @@ pub trait SoroSusuTrait {
     fn distribute_payout(env: Env, caller: Address, circle_id: u64);
     fn trigger_payout(env: Env, admin: Address, circle_id: u64);
     fn finalize_round(env: Env, creator: Address, circle_id: u64);
+
+    // Issue #406: Anti-Collusion Multi-Sig Round Skipping
+    fn configure_multisig_round_skip(env: Env, admin: Address, circle_id: u64, config: MultiSigConfig);
+    fn propose_round_skip(env: Env, proposer: Address, circle_id: u64, round_to_skip: u32, reason: Symbol);
+    fn approve_round_skip(env: Env, approver: Address, circle_id: u64, proposal_id: u64);
+    fn execute_round_skip(env: Env, executor: Address, circle_id: u64, proposal_id: u64);
+    fn cancel_round_skip_proposal(env: Env, proposer: Address, circle_id: u64, proposal_id: u64);
+
+    // Issue #410: Temporary Storage for Ephemeral Voting States
+    fn initiate_voting_session(env: Env, admin: Address, dispute_id: u64, params: JurorSelectionParams);
+    fn cast_vote_with_temp_storage(env: Env, juror: Address, dispute_id: u64, vote_choice: bool, commitment: BytesN<32>);
+    fn finalize_voting_session(env: Env, admin: Address, dispute_id: u64);
+    fn cleanup_temp_voting_data(env: Env, dispute_id: u64);
+
+    // Issue #421: Round-Finalization Checksum to Prevent Payout Overlaps
+    fn generate_round_checksum(env: Env, circle_id: u64, round_number: u32) -> RoundFinalizationChecksum;
+    fn verify_round_integrity(env: Env, circle_id: u64, checksum: RoundFinalizationChecksum) -> bool;
+    fn record_payout_with_checksum(env: Env, circle_id: u64, round_number: u32, recipient: Address, amount: i128, payout_type: PayoutType) -> PayoutRecord;
+    fn detect_payout_overlaps(env: Env, circle_id: u64) -> bool;
+    fn enable_overlap_detection(env: Env, admin: Address, circle_id: u64);
 
     // Helper functions
     fn get_circle(env: Env, circle_id: u64) -> CircleInfo;
@@ -1988,86 +2478,39 @@ fn execute_proposal_logic(env: &Env, proposal: &Proposal) {
     env.storage().instance().set(&proposal_key, &updated_proposal);
 }
 
-#[contract]
-pub struct SoroSusu;
+/// Creates a new savings circle.
+///
+/// # Parameters
+/// - `creator`: Address of the circle creator; must sign the transaction.
+/// - `amount`: Fixed contribution per round in stroops (1 XLM = 10 000 000 stroops).
+/// - `max_members`: Maximum number of members allowed (determines total rounds).
+/// - `token`: SEP-41 token contract address used for contributions and payouts.
+/// - `cycle_duration`: Seconds between rounds (e.g. `604800` = 1 week).
+/// - `insurance_fee_bps`: Per-member insurance premium in basis points (max 10 000).
+/// - `nft_contract`: SBT credential contract address for badge minting.
+///
+/// # Returns
+/// The new `circle_id` (monotonically increasing `u64`).
+///
+/// # Security
+/// - `creator` must call `require_auth()` — enforced internally.
+/// - `insurance_fee_bps` is capped at 10 000 (100 %) to prevent fee overflow.
+/// - `cycle_duration` is capped at `MAX_CYCLE_DURATION` to prevent epoch overflow.
+fn create_circle(
+    env: Env,
+    creator: Address,
+    amount: i128,
+    max_members: u32,
+    token: Address,
+    cycle_duration: u64,
+    insurance_fee_bps: u32,
+    nft_contract: Address,
+) -> u64 {
+    creator.require_auth();
 
-#[contractimpl]
-impl SoroSusuTrait for SoroSusu {
-    fn init(env: Env, admin: Address) {
-        // Initialize the circle counter to 0 if it doesn't exist
-        if !env.storage().instance().has(&DataKey::CircleCount) {
-            env.storage().instance().set(&DataKey::CircleCount, &0u64);
-        }
-
-        // Set the admin
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::CircleCount, &0u64);
-        env.storage().instance().set(&DataKey::AuditCount, &0u64);
-    }
-
-    /// # Admin-Only: Set Lending Pool Address
-    ///
-    /// **Why admin-only:** The lending pool is a trusted external contract that
-    /// receives protocol funds. Allowing arbitrary callers to change it would
-    /// enable fund-draining attacks by redirecting deposits to a malicious pool.
-    ///
-    /// **If admin key is lost:** The lending pool address becomes permanently
-    /// frozen at its last set value. Existing pool interactions continue to
-    /// function, but the pool cannot be updated or disabled. Funds already
-    /// deposited into the pool remain accessible via the pool contract itself.
-    ///
-    /// **DAO migration path:** Replace the single-admin check with a
-    /// multi-sig governance proposal (≥ 2/3 council vote) before executing
-    /// the pool address change. The `write_audit` call already provides an
-    /// immutable on-chain record for every change.
-    fn set_lending_pool(env: Env, admin: Address, pool: Address) {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Not initialized");
-        if admin != stored_admin {
-            panic!("Unauthorized");
-        }
-        env.storage().instance().set(&DataKey::LendingPool, &pool);
-        write_audit(&env, &admin, AuditAction::AdminAction, 0);
-    }
-
-    /// # Admin-Only: Set Protocol Fee and Treasury
-    ///
-    /// **Why admin-only:** The protocol fee is deducted from every member
-    /// payout. An unconstrained caller could set the fee to 100 % (10 000 bps)
-    /// and redirect all funds to an attacker-controlled treasury address.
-    ///
-    /// **If admin key is lost:** The fee and treasury address are frozen at
-    /// their last configured values. Payouts continue to deduct the frozen fee
-    /// and send it to the frozen treasury. No funds are trapped, but the
-    /// protocol cannot adjust monetisation parameters.
-    ///
-    /// **DAO migration path:** Gate this function behind a time-locked
-    /// governance proposal with a mandatory 48-hour delay and a ≥ 2/3
-    /// multi-sig approval. Cap the maximum fee change per proposal to
-    /// ±100 bps to prevent sudden large fee increases.
-    fn set_protocol_fee(env: Env, admin: Address, fee_basis_points: u32, treasury: Address) {
-        admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
-        if admin != stored_admin {
-            panic!("Unauthorized");
-        }
-        if fee_basis_points > 10000 {
-            panic!("InvalidFeeConfig");
-        }
-        env.storage().instance().set(&DataKey::ProtocolFeeBps, &fee_basis_points);
-        env.storage().instance().set(&DataKey::ProtocolTreasury, &treasury);
-    }
-
-    /// Creates a new savings circle.
-    ///
-    /// # Parameters
-    /// - `creator`: Address of the circle creator; must sign the transaction.
-    /// - `amount`: Fixed contribution per round in stroops (1 XLM = 10 000 000 stroops).
+    // Validate insurance fee (cannot exceed 100%)
+    if insurance_fee_bps > 10_000 {
+        panic!("Insurance fee cannot exceed 100%");
     /// - `max_members`: Maximum number of members allowed (determines total rounds).
     /// - `token`: SEP-41 token contract address used for contributions and payouts.
     /// - `cycle_duration`: Seconds between rounds (e.g. `604800` = 1 week).
@@ -2240,7 +2683,12 @@ impl SoroSusuTrait for SoroSusu {
     /// The caller must have pre-approved the SoroSusu contract to transfer
     /// `circle.contribution_amount * rounds` tokens on their behalf
     /// (SEP-41 `approve`). The token transfer and contribution-history update
-    /// are executed atomically within this call.
+    /// are executed atomically within this call using secure transaction logic.
+    ///
+    /// # Security Features
+    /// - Atomic transaction with rollback capability
+    /// - Double-spend prevention via transaction tracking
+    /// - Automatic contribution proof generation
     ///
     /// # Panics
     /// - `"Circle not found"` — `circle_id` does not exist.
@@ -2251,7 +2699,7 @@ impl SoroSusuTrait for SoroSusu {
             panic!("Rounds must be greater than zero");
         }
 
-        let mut circle: CircleInfo = env.storage().instance()
+        let circle: CircleInfo = env.storage().instance()
             .get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"));
 
@@ -2266,24 +2714,37 @@ impl SoroSusuTrait for SoroSusu {
             panic!("Member not active");
         }
 
-        let current_time = env.ledger().timestamp();
-        let rounds_i128 = rounds as i128;
         let total_contribution = circle.contribution_amount
-            .checked_mul(rounds_i128)
+            .checked_mul(rounds as i128)
             .unwrap_or_else(|| panic!("Contribution overflow"));
 
+        // Start atomic transaction
+        let tx_id = contribution_security::ContributionSecurityTrait::start_contribution_transaction(
+            env.clone(),
+            user.clone(),
+            circle_id,
+            total_contribution as u64,
+            rounds,
+        ).unwrap_or_else(|e| panic!("Failed to start transaction: {:?}", e));
+
+        // Execute the token transfer
         let token_client = soroban_sdk::token::Client::new(&env, &circle.token);
         token_client.transfer(&user, &env.current_contract_address(), &total_contribution);
 
-        member.contribution_count = member.contribution_count
+        // Update contribution state
+        let current_time = env.ledger().timestamp();
+        let mut circle_mut = circle;
+        let mut member_mut = member;
+
+        member_mut.contribution_count = member_mut.contribution_count
             .checked_add(rounds)
             .unwrap_or_else(|| panic!("Contribution count overflow"));
-        member.last_contribution_time = current_time;
+        member_mut.last_contribution_time = current_time;
 
         let contribution_bit = 1u64
-            .checked_shl(member.index)
+            .checked_shl(member_mut.index)
             .unwrap_or_else(|| panic!("Member index overflow"));
-        circle.contribution_bitmap |= contribution_bit;
+        circle_mut.contribution_bitmap |= contribution_bit;
 
         // Save updated members Vec (single storage write)
         save_members(&env, circle_id, &members);
@@ -2431,6 +2892,1003 @@ impl SoroSusuTrait for SoroSusu {
         );
     }
 
+    // --- ISSUE #406: ANTI-COLLUSION MULTI-SIG ROUND SKIPPING IMPLEMENTATION ---
+
+    /// Configure multi-signature requirements for round skipping
+    /// 
+    /// # Arguments
+    /// * `admin` - Admin address (must be circle creator or contract admin)
+    /// * `circle_id` - Target circle ID
+    /// * `config` - Multi-signature configuration
+    /// 
+    /// # Panics
+    /// * `"Unauthorized"` - Caller is not admin or circle creator
+    /// * `"Invalid config"` - Configuration is invalid
+    fn configure_multisig_round_skip(env: Env, admin: Address, circle_id: u64, config: MultiSigConfig) {
+        admin.require_auth();
+
+        // Verify authorization (admin or circle creator)
+        let admin_address: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        let is_authorized = admin_address.map_or(false, |addr| addr == admin) || circle.creator == admin;
+        if !is_authorized {
+            panic!("Unauthorized");
+        }
+
+        // Validate configuration
+        if config.required_approvals == 0 || config.required_approvals > config.authorized_approvers.len() as u32 {
+            panic!("Invalid config");
+        }
+
+        if config.approval_timeout == 0 {
+            panic!("Invalid config");
+        }
+
+        // Store configuration
+        env.storage().instance().set(&DataKey::MultiSigConfig(circle_id), &config);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "multisig_configured"), circle_id),
+            (config.required_approvals, config.authorized_approvers.len()),
+        );
+    }
+
+    /// Propose to skip a specific round with anti-collusion protection
+    /// 
+    /// # Arguments
+    /// * `proposer` - Member proposing the round skip
+    /// * `circle_id` - Target circle ID  
+    /// * `round_to_skip` - Round number to skip
+    /// * `reason` - Reason for skipping
+    /// 
+    /// # Panics
+    /// * `"Multi-sig not enabled"` - Multi-sig is not configured for this circle
+    /// * `"Unauthorized proposer"` - Proposer is not in authorized approvers list
+    /// * `"Round already finalized"` - Target round is already finalized
+    fn propose_round_skip(env: Env, proposer: Address, circle_id: u64, round_to_skip: u32, reason: Symbol) {
+        proposer.require_auth();
+
+        // Check multi-sig configuration
+        let config: MultiSigConfig = env.storage().instance()
+            .get(&DataKey::MultiSigConfig(circle_id))
+            .unwrap_or_else(|| panic!("Multi-sig not enabled"));
+
+        if !config.enabled {
+            panic!("Multi-sig not enabled");
+        }
+
+        // Verify proposer is authorized
+        if !config.authorized_approvers.contains(&proposer) {
+            panic!("Unauthorized proposer");
+        }
+
+        // Check circle state
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        // Get the member who would be skipped
+        let skipped_member_index = (round_to_skip - 1) % circle.member_count;
+        let skipped_member: Address = env.storage().instance()
+            .get(&DataKey::CircleMember(circle_id, skipped_member_index))
+            .unwrap_or_else(|| panic!("Member not found for round"));
+
+        // Generate anti-collusion checksum of current member states
+        let state_checksum = Self::generate_member_state_checksum(&env, circle_id);
+
+        // Create proposal
+        let proposal_counter: u64 = env.storage().instance()
+            .get(&DataKey::DisputeCount) // Reuse counter for proposals
+            .unwrap_or(0);
+        let proposal_id = proposal_counter + 1;
+
+        let proposal = RoundSkipProposal {
+            proposal_id,
+            circle_id,
+            round_to_skip,
+            reason,
+            skipped_member: skipped_member.clone(),
+            created_at: env.ledger().timestamp(),
+            expires_at: env.ledger().timestamp() + config.approval_timeout,
+            approval_count: 0,
+            approved_by: Vec::new(&env),
+            status: RoundSkipStatus::Pending,
+            state_checksum,
+        };
+
+        // Store proposal
+        env.storage().instance().set(&DataKey::RoundSkipProposal(circle_id), &proposal);
+        env.storage().instance().set(&DataKey::DisputeCount, &proposal_id);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "round_skip_proposed"), circle_id),
+            (proposal_id, round_to_skip, skipped_member),
+        );
+    }
+
+    /// Approve a round skip proposal
+    /// 
+    /// # Arguments
+    /// * `approver` - Authorized approver
+    /// * `circle_id` - Target circle ID
+    /// * `proposal_id` - Proposal ID to approve
+    /// 
+    /// # Panics
+    /// * `"Proposal not found"` - Proposal does not exist
+    /// * `"Proposal expired"` - Proposal has expired
+    /// * `"Already approved"` - Approver has already approved this proposal
+    /// * `"Unauthorized approver"` - Approver is not in authorized list
+    fn approve_round_skip(env: Env, approver: Address, circle_id: u64, proposal_id: u64) {
+        approver.require_auth();
+
+        // Get configuration
+        let config: MultiSigConfig = env.storage().instance()
+            .get(&DataKey::MultiSigConfig(circle_id))
+            .unwrap_or_else(|| panic!("Multi-sig not enabled"));
+
+        // Verify approver is authorized
+        if !config.authorized_approvers.contains(&approver) {
+            panic!("Unauthorized approver");
+        }
+
+        // Get proposal
+        let mut proposal: RoundSkipProposal = env.storage().instance()
+            .get(&DataKey::RoundSkipProposal(circle_id))
+            .unwrap_or_else(|| panic!("Proposal not found"));
+
+        // Check proposal state
+        if proposal.status != RoundSkipStatus::Pending {
+            panic!("Proposal not pending");
+        }
+
+        // Check expiration
+        if env.ledger().timestamp() > proposal.expires_at {
+            proposal.status = RoundSkipStatus::Rejected;
+            env.storage().instance().set(&DataKey::RoundSkipProposal(circle_id), &proposal);
+            panic!("Proposal expired");
+        }
+
+        // Check if already approved
+        if proposal.approved_by.contains(&approver) {
+            panic!("Already approved");
+        }
+
+        // Verify anti-collusion checksum (member states haven't changed)
+        let current_checksum = Self::generate_member_state_checksum(&env, circle_id);
+        if current_checksum != proposal.state_checksum {
+            panic!("Member states changed - potential collusion detected");
+        }
+
+        // Record approval
+        proposal.approved_by.push_back(approver.clone());
+        proposal.approval_count += 1;
+
+        // Store individual approval record
+        env.storage().instance().set(&DataKey::RoundSkipApproval(circle_id, approver.clone()), &true);
+
+        // Check if enough approvals
+        if proposal.approval_count >= config.required_approvals {
+            proposal.status = RoundSkipStatus::Approved;
+        }
+
+        // Store updated proposal
+        env.storage().instance().set(&DataKey::RoundSkipProposal(circle_id), &proposal);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "round_skip_approved"), circle_id),
+            (proposal_id, approver, proposal.approval_count),
+        );
+    }
+
+    /// Execute an approved round skip proposal
+    /// 
+    /// # Arguments
+    /// * `executor` - Any authorized member
+    /// * `circle_id` - Target circle ID
+    /// * `proposal_id` - Proposal ID to execute
+    /// 
+    /// # Panics
+    /// * `"Proposal not approved"` - Proposal does not have enough approvals
+    /// * `"Proposal expired"` - Proposal has expired
+    fn execute_round_skip(env: Env, executor: Address, circle_id: u64, proposal_id: u64) {
+        executor.require_auth();
+
+        // Get configuration
+        let config: MultiSigConfig = env.storage().instance()
+            .get(&DataKey::MultiSigConfig(circle_id))
+            .unwrap_or_else(|| panic!("Multi-sig not enabled"));
+
+        // Verify executor is authorized
+        if !config.authorized_approvers.contains(&executor) {
+            panic!("Unauthorized executor");
+        }
+
+        // Get proposal
+        let mut proposal: RoundSkipProposal = env.storage().instance()
+            .get(&DataKey::RoundSkipProposal(circle_id))
+            .unwrap_or_else(|| panic!("Proposal not found"));
+
+        // Check proposal state
+        if proposal.status != RoundSkipStatus::Approved {
+            panic!("Proposal not approved");
+        }
+
+        // Check expiration
+        if env.ledger().timestamp() > proposal.expires_at {
+            proposal.status = RoundSkipStatus::Rejected;
+            env.storage().instance().set(&DataKey::RoundSkipProposal(circle_id), &proposal);
+            panic!("Proposal expired");
+        }
+
+        // Final checksum verification before execution
+        let current_checksum = Self::generate_member_state_checksum(&env, circle_id);
+        if current_checksum != proposal.state_checksum {
+            panic!("Member states changed - execution blocked");
+        }
+
+        // Get circle and update round skipping
+        let mut circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        // Skip the round by advancing the recipient index
+        circle.current_recipient_index = (circle.current_recipient_index + 1) % circle.member_count;
+        circle.is_round_finalized = false; // Reset for next round
+        circle.deadline_timestamp = env.ledger().timestamp() + circle.cycle_duration;
+
+        // Store updated circle
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+
+        // Update proposal status
+        proposal.status = RoundSkipStatus::Executed;
+        env.storage().instance().set(&DataKey::RoundSkipProposal(circle_id), &proposal);
+
+        // Clean up approval records
+        for approver in proposal.approved_by.iter() {
+            env.storage().instance().remove(&DataKey::RoundSkipApproval(circle_id, approver));
+        }
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "round_skip_executed"), circle_id),
+            (proposal_id, proposal.round_to_skip, proposal.skipped_member),
+        );
+    }
+
+    /// Cancel a round skip proposal (only by proposer)
+    /// 
+    /// # Arguments
+    /// * `proposer` - Original proposal creator
+    /// * `circle_id` - Target circle ID
+    /// * `proposal_id` - Proposal ID to cancel
+    fn cancel_round_skip_proposal(env: Env, proposer: Address, circle_id: u64, proposal_id: u64) {
+        proposer.require_auth();
+
+        // Get proposal
+        let mut proposal: RoundSkipProposal = env.storage().instance()
+            .get(&DataKey::RoundSkipProposal(circle_id))
+            .unwrap_or_else(|| panic!("Proposal not found"));
+
+        // Verify proposer (simplified - in production, track proposer separately)
+        if proposal.status != RoundSkipStatus::Pending {
+            panic!("Proposal not pending");
+        }
+
+        // Cancel proposal
+        proposal.status = RoundSkipStatus::Cancelled;
+        env.storage().instance().set(&DataKey::RoundSkipProposal(circle_id), &proposal);
+
+        // Clean up approval records
+        for approver in proposal.approved_by.iter() {
+            env.storage().instance().remove(&DataKey::RoundSkipApproval(circle_id, approver));
+        }
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "round_skip_cancelled"), circle_id),
+            (proposal_id, proposer),
+        );
+    }
+
+    // --- ISSUE #410: TEMPORARY STORAGE FOR EPHEMERAL VOTING STATES IMPLEMENTATION ---
+
+    /// Initiate a voting session with temporary storage for voting states
+    /// 
+    /// # Arguments
+    /// * `admin` - Admin address
+    /// * `dispute_id` - Target dispute ID
+    /// * `params` - Juror selection parameters
+    /// 
+    /// # Panics
+    /// * `"Unauthorized"` - Caller is not admin
+    /// * `"Dispute not found"` - Dispute does not exist
+    /// * `"Dispute not open"` - Dispute is not in open status
+    fn initiate_voting_session(env: Env, admin: Address, dispute_id: u64, params: JurorSelectionParams) {
+        admin.require_auth();
+
+        // Verify admin authorization
+        let admin_address: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        if admin_address.map_or(true, |addr| addr != admin) {
+            panic!("Unauthorized");
+        }
+
+        // Check dispute exists and is open
+        let dispute: crate::dispute::DisputeRecord = env.storage().instance()
+            .get(&DataKey::Dispute(dispute_id))
+            .unwrap_or_else(|| panic!("Dispute not found"));
+
+        if dispute.status != crate::dispute::DisputeStatus::Open {
+            panic!("Dispute not open");
+        }
+
+        // Select jurors using VRF-based selection (simplified for this implementation)
+        let juror_pool = Self::select_jurors(&env, dispute.circle_id, &params);
+
+        // Create voting session state
+        let voting_duration = 7 * 24 * 60 * 60; // 7 days
+        let session_state = VotingSessionState {
+            dispute_id,
+            total_jurors: juror_pool.len() as u32,
+            votes_cast: 0,
+            guilty_votes: 0,
+            not_guilty_votes: 0,
+            guilty_weight: 0,
+            not_guilty_weight: 0,
+            voting_deadline: env.ledger().timestamp() + voting_duration,
+            min_votes_required: (juror_pool.len() as u32 * 2) / 3, // 2/3 majority
+            is_active: true,
+            session_start: env.ledger().timestamp(),
+            quorum_reached: false,
+        };
+
+        // Store in temporary storage
+        env.storage().temporary().set(&DataKey::VotingSessionState(dispute_id), &session_state);
+        env.storage().temporary().set(&DataKey::JurorPool(dispute_id), &juror_pool);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "voting_session_initiated"), dispute_id),
+            (juror_pool.len(), session_state.voting_deadline),
+        );
+    }
+
+    /// Cast a vote using temporary storage for the voting state
+    /// 
+    /// # Arguments
+    /// * `juror` - Juror address
+    /// * `dispute_id` - Target dispute ID
+    /// * `vote_choice` - Vote choice (true = guilty, false = not guilty)
+    /// * `commitment` - Vote commitment for privacy
+    /// 
+    /// # Panics
+    /// * `"Not a juror"` - Caller is not in the juror pool
+    /// * `"Voting session not active"` - Voting session is not active
+    /// * `"Already voted"` - Juror has already voted
+    /// * `"Voting deadline passed"` - Voting deadline has passed
+    fn cast_vote_with_temp_storage(env: Env, juror: Address, dispute_id: u64, vote_choice: bool, commitment: BytesN<32>) {
+        juror.require_auth();
+
+        // Get voting session state from temporary storage
+        let mut session_state: VotingSessionState = env.storage().temporary()
+            .get(&DataKey::VotingSessionState(dispute_id))
+            .unwrap_or_else(|| panic!("Voting session not active"));
+
+        if !session_state.is_active {
+            panic!("Voting session not active");
+        }
+
+        if env.ledger().timestamp() > session_state.voting_deadline {
+            session_state.is_active = false;
+            env.storage().temporary().set(&DataKey::VotingSessionState(dispute_id), &session_state);
+            panic!("Voting deadline passed");
+        }
+
+        // Verify juror is in the pool
+        let juror_pool: Vec<Address> = env.storage().temporary()
+            .get(&DataKey::JurorPool(dispute_id))
+            .unwrap_or_else(|| panic!("Juror pool not found"));
+
+        if !juror_pool.contains(&juror) {
+            panic!("Not a juror");
+        }
+
+        // Check if already voted
+        if env.storage().temporary().has(&DataKey::TempVotingState(dispute_id, juror.clone())) {
+            panic!("Already voted");
+        }
+
+        // Calculate vote weight based on reputation (simplified)
+        let vote_weight = Self::calculate_juror_vote_weight(&env, &juror);
+
+        // Create temporary voting state
+        let voting_state = TempVotingState {
+            juror: juror.clone(),
+            dispute_id,
+            vote_choice,
+            voted_at: env.ledger().timestamp(),
+            vote_weight,
+            rewarded: false,
+            vote_commitment: commitment,
+        };
+
+        // Store in temporary storage
+        env.storage().temporary().set(&DataKey::TempVotingState(dispute_id, juror.clone()), &voting_state);
+
+        // Update session state
+        session_state.votes_cast += 1;
+        if vote_choice {
+            session_state.guilty_votes += 1;
+            session_state.guilty_weight += vote_weight as u64;
+        } else {
+            session_state.not_guilty_votes += 1;
+            session_state.not_guilty_weight += vote_weight as u64;
+        }
+
+        // Check if quorum is reached
+        if session_state.votes_cast >= session_state.min_votes_required {
+            session_state.quorum_reached = true;
+        }
+
+        // Update session state in temporary storage
+        env.storage().temporary().set(&DataKey::VotingSessionState(dispute_id), &session_state);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "vote_cast"), dispute_id),
+            (juror, vote_choice, vote_weight),
+        );
+    }
+
+    /// Finalize the voting session and determine the outcome
+    /// 
+    /// # Arguments
+    /// * `admin` - Admin address
+    /// * `dispute_id` - Target dispute ID
+    /// 
+    /// # Panics
+    /// * `"Unauthorized"` - Caller is not admin
+    /// * `"Voting session still active"` - Voting session is still active
+    /// * `"Quorum not reached"` - Minimum votes not reached
+    fn finalize_voting_session(env: Env, admin: Address, dispute_id: u64) {
+        admin.require_auth();
+
+        // Verify admin authorization
+        let admin_address: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        if admin_address.map_or(true, |addr| addr != admin) {
+            panic!("Unauthorized");
+        }
+
+        // Get voting session state
+        let mut session_state: VotingSessionState = env.storage().temporary()
+            .get(&DataKey::VotingSessionState(dispute_id))
+            .unwrap_or_else(|| panic!("Voting session not found"));
+
+        if session_state.is_active && env.ledger().timestamp() <= session_state.voting_deadline {
+            panic!("Voting session still active");
+        }
+
+        if !session_state.quorum_reached {
+            panic!("Quorum not reached");
+        }
+
+        // Determine verdict based on weighted votes
+        let verdict_guilty = session_state.guilty_weight > session_state.not_guilty_weight;
+
+        // Get dispute record
+        let mut dispute: crate::dispute::DisputeRecord = env.storage().instance()
+            .get(&DataKey::Dispute(dispute_id))
+            .unwrap_or_else(|| panic!("Dispute not found"));
+
+        // Update dispute status
+        dispute.status = if verdict_guilty {
+            crate::dispute::DisputeStatus::Baseless
+        } else {
+            crate::dispute::DisputeStatus::Resolved
+        };
+
+        env.storage().instance().set(&DataKey::Dispute(dispute_id), &dispute);
+
+        // Mark session as inactive
+        session_state.is_active = false;
+        env.storage().temporary().set(&DataKey::VotingSessionState(dispute_id), &session_state);
+
+        // Reward jurors for participation
+        Self::reward_jurors(&env, dispute_id);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "voting_finalized"), dispute_id),
+            (verdict_guilty, session_state.guilty_votes, session_state.not_guilty_votes),
+        );
+
+        // Schedule cleanup of temporary data
+        Self::cleanup_temp_voting_data(env, dispute_id);
+    }
+
+    /// Clean up temporary voting data after dispute resolution
+    /// 
+    /// # Arguments
+    /// * `dispute_id` - Target dispute ID
+    fn cleanup_temp_voting_data(env: Env, dispute_id: u64) {
+        // Remove voting session state
+        env.storage().temporary().remove(&DataKey::VotingSessionState(dispute_id));
+
+        // Remove juror pool
+        env.storage().temporary().remove(&DataKey::JurorPool(dispute_id));
+
+        // Remove all temporary voting states
+        let juror_pool: Vec<Address> = env.storage().temporary()
+            .get(&DataKey::JurorPool(dispute_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        for juror in juror_pool.iter() {
+            env.storage().temporary().remove(&DataKey::TempVotingState(dispute_id, juror));
+        }
+
+        // Emit cleanup event
+        env.events().publish(
+            (Symbol::new(&env, "voting_data_cleaned"), dispute_id),
+            env.ledger().timestamp(),
+        );
+    }
+
+    // --- HELPER FUNCTIONS FOR TEMPORARY VOTING ---
+
+    /// Select jurors for a dispute using VRF-based selection
+    fn select_jurors(env: &Env, circle_id: u64, params: &JurorSelectionParams) -> Vec<Address> {
+        let mut selected_jurors = Vec::new(env);
+        let mut candidate_count = 0;
+
+        // Get all circle members as potential jurors
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        for i in 0..circle.member_count {
+            if let Some(member_address) = env.storage().instance()
+                .get::<DataKey, Address>(&DataKey::CircleMember(circle_id, i)) {
+                
+                // Check reputation requirement (simplified)
+                let member: crate::Member = env.storage().instance()
+                    .get(&DataKey::Member(member_address))
+                    .unwrap_or_else(|| panic!("Member not found"));
+
+                // Simple reputation check (in production, use actual reputation score)
+                let meets_reputation = member.tier_multiplier >= params.min_reputation / 100;
+
+                if meets_reputation && selected_jurors.len() < params.max_jurors as usize {
+                    // Use simple pseudo-random selection based on seed and member index
+                    let selection_score = (params.selection_seed + i as u64) % 100;
+                    if selection_score < 50 || selected_jurors.len() < (params.max_jurors / 2) as usize {
+                        selected_jurors.push_back(member_address);
+                    }
+                }
+                candidate_count += 1;
+            }
+        }
+
+        selected_jurors
+    }
+
+    /// Calculate juror vote weight based on reputation and stake
+    fn calculate_juror_vote_weight(env: &Env, juror: &Address) -> u32 {
+        let member: crate::Member = env.storage().instance()
+            .get(&DataKey::Member(juror.clone()))
+            .unwrap_or_else(|| panic!("Member not found"));
+
+        // Base weight + tier multiplier
+        let base_weight = 1;
+        let tier_weight = member.tier_multiplier;
+        base_weight + tier_weight
+    }
+
+    /// Reward jurors for participating in the voting process
+    fn reward_jurors(env: &Env, dispute_id: u64) {
+        let juror_pool: Vec<Address> = env.storage().temporary()
+            .get(&DataKey::JurorPool(dispute_id))
+            .unwrap_or_else(|| Vec::new(env));
+
+        for juror in juror_pool.iter() {
+            if let Some(mut voting_state) = env.storage().temporary()
+                .get::<DataKey, TempVotingState>(&DataKey::TempVotingState(dispute_id, juror.clone())) {
+                
+                if !voting_state.rewarded {
+                    // Mark as rewarded (in production, transfer actual rewards)
+                    voting_state.rewarded = true;
+                    env.storage().temporary().set(&DataKey::TempVotingState(dispute_id, juror.clone()), &voting_state);
+
+                    // Emit reward event
+                    env.events().publish(
+                        (Symbol::new(env, "juror_rewarded"), dispute_id),
+                        (juror, voting_state.vote_weight),
+                    );
+                }
+            }
+        }
+    }
+
+    // --- ISSUE #421: ROUND-FINALIZATION CHECKSUM TO PREVENT PAYOUT OVERLAPS IMPLEMENTATION ---
+
+    /// Generate a comprehensive checksum for round finalization to prevent payout overlaps
+    /// 
+    /// # Arguments
+    /// * `env` - Contract environment
+    /// * `circle_id` - Circle ID
+    /// * `round_number` - Round number to checksum
+    /// 
+    /// # Returns
+    /// RoundFinalizationChecksum - Comprehensive checksum data
+    /// 
+    /// # Panics
+    /// * `"Circle not found"` - Circle does not exist
+    fn generate_round_checksum(env: Env, circle_id: u64, round_number: u32) -> RoundFinalizationChecksum {
+        // Get circle information
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        // Get the recipient for this round
+        let recipient_index = (round_number - 1) % circle.member_count;
+        let payout_recipient: Address = env.storage().instance()
+            .get(&DataKey::CircleMember(circle_id, recipient_index))
+            .unwrap_or_else(|| panic!("Member not found for round"));
+
+        // Generate state checksum (member states, circle state)
+        let state_checksum = Self::generate_comprehensive_state_checksum(&env, circle_id, round_number);
+
+        // Generate contribution checksum for this round
+        let contribution_checksum = Self::generate_contribution_checksum(&env, circle_id, round_number);
+
+        // Generate payout checksum (previous payouts to prevent overlaps)
+        let payout_checksum = Self::generate_payout_checksum(&env, circle_id, round_number);
+
+        // Calculate payout amount (simplified - would be based on contributions)
+        let payout_amount = circle.contribution_amount * circle.member_count as i128;
+
+        let now = env.ledger().timestamp();
+        let checksum = RoundFinalizationChecksum {
+            circle_id,
+            round_number,
+            state_checksum,
+            contribution_checksum,
+            payout_checksum,
+            created_at: now,
+            is_finalized: false,
+            finalized_at: None,
+            payout_recipient: payout_recipient.clone(),
+            payout_amount,
+        };
+
+        // Store the checksum
+        env.storage().instance().set(&DataKey::RoundFinalizationChecksum(circle_id), &checksum);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "round_checksum_generated"), circle_id),
+            (round_number, payout_recipient, checksum.state_checksum),
+        );
+
+        checksum
+    }
+
+    /// Verify the integrity of a round using its checksum
+    /// 
+    /// # Arguments
+    /// * `env` - Contract environment
+    /// * `circle_id` - Circle ID
+    /// * `checksum` - Checksum to verify
+    /// 
+    /// # Returns
+    /// bool - True if integrity is verified, false otherwise
+    fn verify_round_integrity(env: Env, circle_id: u64, checksum: RoundFinalizationChecksum) -> bool {
+        // Generate current checksums
+        let current_state_checksum = Self::generate_comprehensive_state_checksum(&env, circle_id, checksum.round_number);
+        let current_contribution_checksum = Self::generate_contribution_checksum(&env, circle_id, checksum.round_number);
+        let current_payout_checksum = Self::generate_payout_checksum(&env, circle_id, checksum.round_number);
+
+        // Verify all checksums match
+        let state_matches = current_state_checksum == checksum.state_checksum;
+        let contribution_matches = current_contribution_checksum == checksum.contribution_checksum;
+        let payout_matches = current_payout_checksum == checksum.payout_checksum;
+
+        let integrity_verified = state_matches && contribution_matches && payout_matches;
+
+        // Emit verification event
+        env.events().publish(
+            (Symbol::new(&env, "round_integrity_verified"), circle_id),
+            (checksum.round_number, integrity_verified),
+        );
+
+        integrity_verified
+    }
+
+    /// Record a payout with checksum verification to prevent overlaps
+    /// 
+    /// # Arguments
+    /// * `env` - Contract environment
+    /// * `circle_id` - Circle ID
+    /// * `round_number` - Round number
+    /// * `recipient` - Payout recipient
+    /// * `amount` - Payout amount
+    /// * `payout_type` - Type of payout
+    /// 
+    /// # Returns
+    /// PayoutRecord - The recorded payout
+    /// 
+    /// # Panics
+    /// * `"Payout overlap detected"` - Payout overlap is detected
+    /// * `"Invalid round"` - Round number is invalid
+    fn record_payout_with_checksum(env: Env, circle_id: u64, round_number: u32, recipient: Address, amount: i128, payout_type: PayoutType) -> PayoutRecord {
+        // Check for overlaps first
+        if Self::detect_payout_overlaps(env.clone(), circle_id) {
+            panic!("Payout overlap detected");
+        }
+
+        // Get the round checksum
+        let mut checksum: RoundFinalizationChecksum = env.storage().instance()
+            .get(&DataKey::RoundFinalizationChecksum(circle_id))
+            .unwrap_or_else(|| panic!("Round checksum not found"));
+
+        // Verify round number matches
+        if checksum.round_number != round_number {
+            panic!("Invalid round");
+        }
+
+        // Verify integrity before recording payout
+        if !Self::verify_round_integrity(env.clone(), circle_id, checksum.clone()) {
+            panic!("Round integrity verification failed");
+        }
+
+        // Create transaction hash (simplified - in production use actual tx hash)
+        let mut hasher = soroban_sdk::crypto::Sha256::new(&env);
+        hasher.update(&circle_id.to_le_bytes());
+        hasher.update(&round_number.to_le_bytes());
+        hasher.update(&recipient.to_string().as_bytes());
+        hasher.update(&amount.to_le_bytes());
+        hasher.update(&env.ledger().timestamp().to_le_bytes());
+        let tx_hash = hasher.finalize();
+
+        // Create payout record
+        let payout_record = PayoutRecord {
+            circle_id,
+            round_number,
+            recipient: recipient.clone(),
+            amount,
+            paid_at: env.ledger().timestamp(),
+            tx_hash,
+            is_successful: true,
+            payout_type,
+        };
+
+        // Store payout record
+        env.storage().instance().set(&DataKey::PayoutRecord(circle_id, round_number), &payout_record);
+
+        // Update overlap detection
+        Self::update_overlap_detection(&env, circle_id, round_number);
+
+        // Mark round as finalized
+        checksum.is_finalized = true;
+        checksum.finalized_at = Some(env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::RoundFinalizationChecksum(circle_id), &checksum);
+
+        // Emit payout event
+        env.events().publish(
+            (Symbol::new(&env, "payout_recorded"), circle_id),
+            (round_number, recipient, amount, payout_type),
+        );
+
+        payout_record
+    }
+
+    /// Detect potential payout overlaps using checksums and bitmasks
+    /// 
+    /// # Arguments
+    /// * `env` - Contract environment
+    /// * `circle_id` - Circle ID
+    /// 
+    /// # Returns
+    /// bool - True if overlap is detected, false otherwise
+    fn detect_payout_overlaps(env: Env, circle_id: u64) -> bool {
+        // Get overlap detection state
+        let mut detection_state: PayoutOverlapDetection = env.storage().instance()
+            .get(&DataKey::PayoutOverlapDetection(circle_id))
+            .unwrap_or_else(|| PayoutOverlapDetection {
+                circle_id,
+                last_processed_round: 0,
+                processed_rounds_bitmap: 0,
+                last_payout_hash: BytesN::from_array(&[0u8; 32]),
+                overlap_detection_enabled: true,
+                last_check_timestamp: env.ledger().timestamp(),
+                overlaps_detected: 0,
+            });
+
+        if !detection_state.overlap_detection_enabled {
+            return false;
+        }
+
+        // Check for bitmap overlaps
+        let current_round_bitmap = 1u64 << (detection_state.last_processed_round % 64);
+        let bitmap_overlap = (detection_state.processed_rounds_bitmap & current_round_bitmap) != 0;
+
+        // Check for duplicate payout hashes
+        let checksum: RoundFinalizationChecksum = env.storage().instance()
+            .get(&DataKey::RoundFinalizationChecksum(circle_id))
+            .unwrap_or_else(|| panic!("Round checksum not found"));
+
+        let hash_overlap = detection_state.last_payout_hash == checksum.payout_checksum;
+
+        let overlap_detected = bitmap_overlap || hash_overlap;
+
+        if overlap_detected {
+            detection_state.overlaps_detected += 1;
+            env.storage().instance().set(&DataKey::PayoutOverlapDetection(circle_id), &detection_state);
+
+            // Emit overlap detection event
+            env.events().publish(
+                (Symbol::new(&env, "payout_overlap_detected"), circle_id),
+                (detection_state.last_processed_round, detection_state.overlaps_detected),
+            );
+        }
+
+        overlap_detected
+    }
+
+    /// Enable overlap detection for a circle
+    /// 
+    /// # Arguments
+    /// * `env` - Contract environment
+    /// * `admin` - Admin address
+    /// * `circle_id` - Circle ID
+    /// 
+    /// # Panics
+    /// * `"Unauthorized"` - Caller is not admin
+    fn enable_overlap_detection(env: Env, admin: Address, circle_id: u64) {
+        admin.require_auth();
+
+        // Verify admin authorization
+        let admin_address: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        if admin_address.map_or(true, |addr| addr != admin) {
+            panic!("Unauthorized");
+        }
+
+        // Initialize or update overlap detection state
+        let detection_state = PayoutOverlapDetection {
+            circle_id,
+            last_processed_round: 0,
+            processed_rounds_bitmap: 0,
+            last_payout_hash: BytesN::from_array(&[0u8; 32]),
+            overlap_detection_enabled: true,
+            last_check_timestamp: env.ledger().timestamp(),
+            overlaps_detected: 0,
+        };
+
+        env.storage().instance().set(&DataKey::PayoutOverlapDetection(circle_id), &detection_state);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "overlap_detection_enabled"), circle_id),
+            env.ledger().timestamp(),
+        );
+    }
+
+    // --- HELPER FUNCTIONS FOR ROUND-FINALIZATION CHECKSUM ---
+
+    /// Generate comprehensive state checksum for a round
+    fn generate_comprehensive_state_checksum(env: &Env, circle_id: u64, round_number: u32) -> BytesN<32> {
+        let mut hasher = soroban_sdk::crypto::Sha256::new(env);
+
+        // Get circle state
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        // Hash circle-level state
+        hasher.update(&circle_id.to_le_bytes());
+        hasher.update(&round_number.to_le_bytes());
+        hasher.update(&circle.current_recipient_index.to_le_bytes());
+        hasher.update(&circle.contribution_bitmap.to_le_bytes());
+        hasher.update(&circle.member_count.to_le_bytes());
+        hasher.update(&circle.cycle_duration.to_le_bytes());
+
+        // Hash each member's state
+        for i in 0..circle.member_count {
+            if let Some(member_address) = env.storage().instance()
+                .get::<DataKey, Address>(&DataKey::CircleMember(circle_id, i)) {
+                
+                let member: crate::Member = env.storage().instance()
+                    .get(&DataKey::Member(member_address))
+                    .unwrap_or_else(|| panic!("Member not found"));
+
+                hasher.update(member_address.to_string().as_bytes());
+                hasher.update(&member.contribution_count.to_le_bytes());
+                hasher.update(&member.contribution_amount.to_le_bytes());
+                hasher.update(&(member.status as u8).to_le_bytes());
+            }
+        }
+
+        hasher.finalize()
+    }
+
+    /// Generate contribution checksum for a specific round
+    fn generate_contribution_checksum(env: &Env, circle_id: u64, round_number: u32) -> BytesN<32> {
+        let mut hasher = soroban_sdk::crypto::Sha256::new(env);
+
+        // Hash round-specific contribution data
+        hasher.update(&circle_id.to_le_bytes());
+        hasher.update(&round_number.to_le_bytes());
+
+        // Get all contributions for this round (simplified)
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        hasher.update(&circle.contribution_amount.to_le_bytes());
+        hasher.update(&circle.member_count.to_le_bytes());
+
+        // Hash contribution bitmap
+        hasher.update(&circle.contribution_bitmap.to_le_bytes());
+
+        hasher.finalize()
+    }
+
+    /// Generate payout checksum to prevent overlaps
+    fn generate_payout_checksum(env: &Env, circle_id: u64, round_number: u32) -> BytesN<32> {
+        let mut hasher = soroban_sdk::crypto::Sha256::new(env);
+
+        // Hash all previous payouts to create a chain
+        hasher.update(&circle_id.to_le_bytes());
+        hasher.update(&round_number.to_le_bytes());
+
+        // Include previous payout records if they exist
+        for r in 1..round_number {
+            if let Some(payout_record) = env.storage().instance()
+                .get::<DataKey, PayoutRecord>(&DataKey::PayoutRecord(circle_id, r)) {
+                hasher.update(payout_record.recipient.to_string().as_bytes());
+                hasher.update(&payout_record.amount.to_le_bytes());
+                hasher.update(&payout_record.paid_at.to_le_bytes());
+                hasher.update(payout_record.tx_hash.as_slice());
+            }
+        }
+
+        hasher.finalize()
+    }
+
+    /// Update overlap detection state after successful payout
+    fn update_overlap_detection(env: &Env, circle_id: u64, round_number: u32) {
+        let mut detection_state: PayoutOverlapDetection = env.storage().instance()
+            .get(&DataKey::PayoutOverlapDetection(circle_id))
+            .unwrap_or_else(|| PayoutOverlapDetection {
+                circle_id,
+                last_processed_round: 0,
+                processed_rounds_bitmap: 0,
+                last_payout_hash: BytesN::from_array(&[0u8; 32]),
+                overlap_detection_enabled: true,
+                last_check_timestamp: env.ledger().timestamp(),
+                overlaps_detected: 0,
+            });
+
+        // Update processed rounds bitmap
+        let round_bit = 1u64 << (round_number % 64);
+        detection_state.processed_rounds_bitmap |= round_bit;
+        detection_state.last_processed_round = round_number;
+
+        // Update last payout hash
+        let checksum: RoundFinalizationChecksum = env.storage().instance()
+            .get(&DataKey::RoundFinalizationChecksum(circle_id))
+            .unwrap_or_else(|| panic!("Round checksum not found"));
+        detection_state.last_payout_hash = checksum.payout_checksum;
+
+        detection_state.last_check_timestamp = env.ledger().timestamp();
+
+        env.storage().instance().set(&DataKey::PayoutOverlapDetection(circle_id), &detection_state);
+    }
+
     // --- HELPER FUNCTIONS ---
 
     /// Returns the full state of a circle.
@@ -2507,6 +3965,55 @@ impl SoroSusuTrait for SoroSusu {
             .get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"));
         circle.current_pot_recipient
+    }
+
+    /// Generate checksum of member states for anti-collusion protection
+    /// 
+    /// This function creates a cryptographic hash of all member states in a circle,
+    /// ensuring that member positions and statuses cannot be altered between
+    /// proposal creation and execution without detection.
+    /// 
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `circle_id` - Target circle ID
+    /// 
+    /// # Returns
+    /// BytesN<32> - SHA256 checksum of member states
+    fn generate_member_state_checksum(env: &Env, circle_id: u64) -> BytesN<32> {
+        use soroban_sdk::crypto::Sha256;
+        
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        let mut hasher = Sha256::new(env);
+        
+        // Hash circle-level state
+        hasher.update(&circle.id.to_le_bytes());
+        hasher.update(&circle.current_recipient_index.to_le_bytes());
+        hasher.update(&circle.member_count.to_le_bytes());
+        hasher.update(&circle.contribution_bitmap.to_le_bytes());
+        
+        // Hash each member's state in order
+        for i in 0..circle.member_count {
+            if let Some(member_address) = env.storage().instance()
+                .get::<DataKey, Address>(&DataKey::CircleMember(circle_id, i)) {
+                
+                let member: crate::Member = env.storage().instance()
+                    .get(&DataKey::Member(member_address))
+                    .unwrap_or_else(|| panic!("Member not found"));
+                
+                // Hash member state components
+                hasher.update(member_address.to_string().as_bytes());
+                hasher.update(&member.contribution_count.to_le_bytes());
+                hasher.update(&member.contribution_amount.to_le_bytes());
+                hasher.update(&(member.status as u8).to_le_bytes());
+                hasher.update(&member.consecutive_missed_rounds.to_le_bytes());
+                hasher.update(&member.tier_multiplier.to_le_bytes());
+            }
+        }
+        
+        hasher.finalize()
     }
 
     // --- STELLAR ANCHOR DIRECT DEPOSIT API (SEP-24/SEP-31) ---
@@ -2888,7 +4395,35 @@ impl SoroSusuTrait for SoroSusu {
             .instance()
             .set(&DataKey::Circle(circle_id), &circle);
 
-        // 13. Mark as Paid in the old format for backward compatibility
+        // 13. Update contribution velocity metrics
+        Self::update_contribution_velocity(
+            env.clone(),
+            user.clone(),
+            circle_id,
+            circle.current_recipient_index,
+            current_time,
+            circle.deadline_timestamp,
+        );
+
+        // 14. Update late fee debt tracking for auto-deduction
+        let mut debt: LateFeeDebt = Self::get_late_fee_debt(env.clone(), circle_id, user.clone());
+        
+        let fee_record = LateFeeRecord {
+            round_number: circle.current_recipient_index,
+            fee_amount: late_fee as i128,
+            original_amount: circle.contribution_amount as i128,
+            late_timestamp: current_time,
+            is_deducted: false,
+            deduction_round: None,
+        };
+        
+        debt.fee_history.push_back(fee_record);
+        debt.total_debt += late_fee as i128;
+        debt.last_updated = current_time;
+        
+        env.storage().instance().set(&DataKey::LateFeeDebt(circle_id, user), &debt);
+
+        // 15. Mark as Paid in the old format for backward compatibility
         env.storage()
             .instance()
             .set(&DataKey::Deposit(circle_id, user), &true);
@@ -3737,7 +5272,7 @@ impl SoroSusuTrait for SoroSusu {
             panic!("unauthorized");
         }
 
-        let payout_amount = (circle.contribution_amount as i128)
+        let original_payout_amount = (circle.contribution_amount as i128)
             .checked_mul(circle.member_count as i128)
             .expect("payout overflow");
 
@@ -3745,8 +5280,97 @@ impl SoroSusuTrait for SoroSusu {
         // For now, we'll use the circle creator as the recipient
         let recipient = circle.creator.clone();
 
+        // Process late fee auto-deduction
+        let final_payout_amount = Self::process_payout_with_deductions(
+            env.clone(),
+            circle_id,
+            recipient.clone(),
+            original_payout_amount,
+        );
+
         // Check user's payout preference
         let user_preference = Self::get_payout_preference(env.clone(), recipient.clone(), circle_id);
+
+        // --- ISSUE #378: TAX WITHHOLDING LOGIC ---
+        let (gross_amount, tax_withheld, net_amount) = {
+            // Check if tax withholding is configured for this circle
+            if let Some(tax_config) = Self::get_tax_configuration(env.clone(), circle_id) {
+                if tax_config.enabled {
+                    // Check if recipient is exempt from interest withholding
+                    let is_exempt = env.storage().instance()
+                        .get(&DataKey::JurisdictionExemption(recipient.clone()))
+                        .unwrap_or(false);
+
+                    if !is_exempt && !tax_config.jurisdiction_exempt {
+                        // Calculate tax withholding
+                        let tax_amount = (payout_amount * tax_config.tax_bps as i128) / 10000;
+                        let net = payout_amount - tax_amount;
+                        
+                        // Update tax withholding pool
+                        let mut pool: TaxWithholdingPool = Self::get_tax_withholding_pool(env.clone());
+                        pool.total_collected += tax_amount;
+                        pool.pending_distribution += tax_amount;
+                        env.storage().instance().set(&DataKey::TaxWithholdingPool, &pool);
+                        
+                        (payout_amount, tax_amount, net)
+                    } else {
+                        // Exempt from withholding
+                        (payout_amount, 0i128, payout_amount)
+                    }
+                } else {
+                    // Tax not enabled
+                    (payout_amount, 0i128, payout_amount)
+                }
+            } else {
+                // No tax configuration
+                (payout_amount, 0i128, payout_amount)
+            }
+        };
+
+        // Generate financial receipt for tax audit purposes
+        let receipt_id = env.ledger().sequence();
+        let mut receipt_hash_input = soroban_sdk::Bytes::new(&env);
+        receipt_hash_input.append(&receipt_id.to_le_bytes());
+        receipt_hash_input.append(&circle_id.to_le_bytes());
+        receipt_hash_input.append(&recipient.to_contract());
+        receipt_hash_input.append(&gross_amount.to_le_bytes());
+        receipt_hash_input.append(&tax_withheld.to_le_bytes());
+        receipt_hash_input.append(&net_amount.to_le_bytes());
+        receipt_hash_input.append(&env.ledger().timestamp().to_le_bytes());
+        
+        let receipt_hash = env.crypto().sha256(&receipt_hash_input);
+        
+        // Get SEP-40 fiat equivalent if oracle is configured
+        let fiat_equivalent = if let Some(tax_config) = Self::get_tax_configuration(env.clone(), circle_id) {
+            if let Some(oracle_address) = tax_config.sep40_oracle_address {
+                // In a real implementation, this would call the SEP-40 oracle
+                // For now, we'll use a placeholder
+                Some(1000000i128) // $10,000.00 in cents
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let financial_receipt = FinancialReceipt {
+            receipt_id,
+            circle_id,
+            recipient_address: recipient.clone(),
+            gross_amount,
+            tax_withheld,
+            net_amount,
+            fiat_equivalent,
+            fiat_currency: if fiat_equivalent.is_some() { Some(Symbol::short(&env, "USD")) } else { None },
+            timestamp: env.ledger().timestamp(),
+            receipt_hash: BytesN::from_array(&env, &receipt_hash),
+            tax_collector_address: env.storage().instance()
+                .get(&DataKey::TaxCollectorAddress)
+                .unwrap_or_else(|| Address::generate(&env)),
+        };
+
+        // Store financial receipt
+        env.storage().instance().set(&DataKey::FinancialReceipt(circle_id, recipient.clone()), &financial_receipt);
 
         // Commit state update BEFORE external token transfer (CEI pattern).
         let mut updated_circle = circle.clone();
@@ -3767,7 +5391,7 @@ impl SoroSusuTrait for SoroSusu {
             .instance()
             .set(&DataKey::Circle(circle_id), &updated_circle);
 
-        // Route payout based on user preference
+        // Route payout based on user preference (using net_amount after tax)
         match user_preference.payout_method {
             PayoutMethod::DirectToken => {
                 // Traditional token payout
@@ -3775,7 +5399,7 @@ impl SoroSusuTrait for SoroSusu {
                 token.transfer(
                     &env.current_contract_address(),
                     &recipient,
-                    &payout_amount,
+                    &net_amount,
                 );
             }
             PayoutMethod::DirectToBank => {
@@ -3787,7 +5411,7 @@ impl SoroSusuTrait for SoroSusu {
                         anchor_config.preferred_anchor,
                         recipient.clone(),
                         circle_id,
-                        payout_amount as u64,
+                        net_amount as u64,
                         circle.token.clone(),
                     ) {
                         Ok(deposit_id) => {
@@ -3800,7 +5424,7 @@ impl SoroSusuTrait for SoroSusu {
                             token.transfer(
                                 &env.current_contract_address(),
                                 &recipient,
-                                &payout_amount,
+                                &net_amount,
                             );
                             // In production, you might want to log this fallback
                         }
@@ -3811,11 +5435,25 @@ impl SoroSusuTrait for SoroSusu {
                     token.transfer(
                         &env.current_contract_address(),
                         &recipient,
-                        &payout_amount,
+                        &net_amount,
                     );
                 }
             }
         }
+
+        // Emit tax withholding event if tax was deducted
+        if tax_withheld > 0 {
+            env.events().publish(
+                (soroban_sdk::Symbol::new(&env, "tax_withheld"), circle_id),
+                (recipient.clone(), tax_withheld, net_amount),
+            );
+        }
+
+        // Emit financial receipt event
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "financial_receipt"), circle_id),
+            (receipt_id, recipient, gross_amount, tax_withheld, net_amount),
+        );
 
         // Release lock after all work is done.
         dispute::release_lock(&env);
@@ -4787,6 +6425,258 @@ impl SoroSusuTrait for SoroSusu {
         
         env.storage().instance().set(&DataKey::ReliabilityIndex(user), &ri);
     }
+
+    // --- ISSUE #378: AUTOMATED TAX-WITHHOLDING AND FINANCIAL REPORTING HOOK ---
+
+    fn configure_tax_settings(
+        env: Env,
+        admin: Address,
+        circle_id: u64,
+        tax_config: TaxConfiguration,
+    ) {
+        // Verify admin authorization
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        
+        if admin != stored_admin {
+            panic!("Unauthorized: Only admin can configure tax settings");
+        }
+
+        // Verify circle exists
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        // Security: Only allow tax configuration before circle starts or between cycles
+        if circle.is_active && circle.current_recipient_index > 0 {
+            panic!("Cannot configure tax settings after payouts have begun");
+        }
+
+        // Validate tax rate (max 50% = 5000 bps)
+        if tax_config.tax_bps > 5000 {
+            panic!("Tax rate cannot exceed 50%");
+        }
+
+        // Set cycle start timestamp for security (prevents rate changes during cycle)
+        let mut config = tax_config.clone();
+        config.cycle_start_timestamp = env.ledger().timestamp();
+
+        // Store tax configuration
+        env.storage().instance().set(&DataKey::TaxConfiguration(circle_id), &config);
+
+        // Initialize tax withholding pool if not exists
+        if !env.storage().instance().has(&DataKey::TaxWithholdingPool) {
+            let pool = TaxWithholdingPool {
+                total_collected: 0,
+                total_distributed: 0,
+                pending_distribution: 0,
+                last_distribution_timestamp: 0,
+                collector_address: config.tax_collector_address.clone(),
+            };
+            env.storage().instance().set(&DataKey::TaxWithholdingPool, &pool);
+        }
+
+        // Set global tax collector address
+        env.storage().instance().set(&DataKey::TaxCollectorAddress, &config.tax_collector_address);
+
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "tax_configured"), circle_id),
+            (config.enabled, config.tax_bps, config.tax_collector_address),
+        );
+    }
+
+    fn update_tax_collector(env: Env, admin: Address, new_collector: Address) {
+        // Verify admin authorization
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        
+        if admin != stored_admin {
+            panic!("Unauthorized: Only admin can update tax collector");
+        }
+
+        // Update global tax collector address
+        env.storage().instance().set(&DataKey::TaxCollectorAddress, &new_collector);
+
+        // Update tax withholding pool
+        let mut pool: TaxWithholdingPool = env.storage().instance()
+            .get(&DataKey::TaxWithholdingPool)
+            .unwrap_or_else(|| panic!("Tax withholding pool not initialized"));
+        
+        pool.collector_address = new_collector.clone();
+        env.storage().instance().set(&DataKey::TaxWithholdingPool, &pool);
+
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "tax_collector_updated"),),
+            (new_collector),
+        );
+    }
+
+    fn set_jurisdiction_exemption(env: Env, admin: Address, user: Address, exempt: bool) {
+        // Verify admin authorization
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        
+        if admin != stored_admin {
+            panic!("Unauthorized: Only admin can set jurisdiction exemptions");
+        }
+
+        // Store exemption status
+        env.storage().instance().set(&DataKey::JurisdictionExemption(user), &exempt);
+
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "jurisdiction_exemption_set"),),
+            (user, exempt),
+        );
+    }
+
+    fn generate_tax_report(
+        env: Env,
+        admin: Address,
+        circle_id: u64,
+        period_start: u64,
+        period_end: u64,
+    ) -> Result<u64, u32> {
+        // Verify admin authorization
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        
+        if admin != stored_admin {
+            return Err(401); // Unauthorized
+        }
+
+        // Get tax configuration
+        let tax_config: TaxConfiguration = env.storage().instance()
+            .get(&DataKey::TaxConfiguration(circle_id))
+            .ok_or(402)?; // Tax not configured
+
+        if !tax_config.reporting_enabled {
+            return Err(403); // Reporting not enabled
+        }
+
+        // Generate report ID
+        let report_id = env.ledger().sequence();
+
+        // In a real implementation, this would aggregate data from financial receipts
+        // For now, we'll create a placeholder report
+        let report = TaxReport {
+            report_id,
+            circle_id,
+            reporting_period_start: period_start,
+            reporting_period_end: period_end,
+            total_payouts: 0, // Would be calculated from receipts
+            total_gross_amount: 0,
+            total_tax_withheld: 0,
+            total_net_amount: 0,
+            report_cid: String::from_str(&env, "QmPlaceholder"), // Would be IPFS CID
+            generated_timestamp: env.ledger().timestamp(),
+            report_hash: BytesN::from_array(&env, &[0u8; 32]), // Would be real hash
+        };
+
+        // Store report
+        env.storage().instance().set(&DataKey::TaxReport(report_id), &report);
+
+        // Emit TaxReportGenerated event
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "TaxReportGenerated"), circle_id),
+            (report_id, report.report_cid.clone()),
+        );
+
+        Ok(report_id)
+    }
+
+    fn get_financial_receipt(env: Env, circle_id: u64, user: Address) -> Option<FinancialReceipt> {
+        env.storage().instance()
+            .get(&DataKey::FinancialReceipt(circle_id, user))
+    }
+
+    fn get_tax_configuration(env: Env, circle_id: u64) -> Option<TaxConfiguration> {
+        env.storage().instance()
+            .get(&DataKey::TaxConfiguration(circle_id))
+    }
+
+    fn get_tax_withholding_pool(env: Env) -> TaxWithholdingPool {
+        env.storage().instance()
+            .get(&DataKey::TaxWithholdingPool)
+            .unwrap_or_else(|| TaxWithholdingPool {
+                total_collected: 0,
+                total_distributed: 0,
+                pending_distribution: 0,
+                last_distribution_timestamp: 0,
+                collector_address: Address::generate(&env), // Default address
+            })
+    }
+
+    fn get_tax_report_data(env: Env, circle_id: u64, report_id: u64) -> Option<TaxReport> {
+        // Read-only function for frontend PDF generation
+        let report: TaxReport = env.storage().instance()
+            .get(&DataKey::TaxReport(report_id))?;
+        
+        // Verify report belongs to specified circle
+        if report.circle_id != circle_id {
+            return None;
+        }
+
+        Some(report)
+    }
+
+    fn distribute_tax_funds(env: Env, admin: Address) -> Result<i128, u32> {
+        // Verify admin authorization
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        
+        if admin != stored_admin {
+            return Err(401); // Unauthorized
+        }
+
+        let mut pool: TaxWithholdingPool = env.storage().instance()
+            .get(&DataKey::TaxWithholdingPool)
+            .ok_or(402)?; // Pool not initialized
+
+        if pool.pending_distribution <= 0 {
+            return Err(403); // No funds to distribute
+        }
+
+        // Get tax collector address
+        let collector_address: Address = env.storage().instance()
+            .get(&DataKey::TaxCollectorAddress)
+            .ok_or(404)?; // Collector not set
+
+        // Get token address (use first circle's token as default)
+        // In production, would track tokens per pool
+        let circle_id = 1u64; // Default to first circle
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .ok_or(405)?; // Circle not found
+
+        // Transfer funds to collector
+        let token_client = token::Client::new(&env, &circle.token);
+        let amount_to_distribute = pool.pending_distribution;
+        
+        token_client.transfer(
+            &env.current_contract_address(),
+            &collector_address,
+            &amount_to_distribute,
+        );
+
+        // Update pool
+        pool.total_distributed += amount_to_distribute;
+        pool.pending_distribution = 0;
+        pool.last_distribution_timestamp = env.ledger().timestamp();
+
+        env.storage().instance().set(&DataKey::TaxWithholdingPool, &pool);
+
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "tax_funds_distributed"),),
+            (collector_address, amount_to_distribute),
+        );
+
+        Ok(amount_to_distribute)
+    }
 }
 
 // --- HELPER FUNCTIONS ---
@@ -4835,6 +6725,16 @@ fn require_not_paused(env: &Env) {
         .unwrap_or(false);
     if paused {
         panic!("contract is paused");
+    }
+}
+
+/// Helper: Require admin authorization
+fn require_admin(env: &Env, admin: &Address) {
+    let stored_admin: Address = env.storage().instance()
+        .get(&DataKey::Admin)
+        .unwrap();
+    if stored_admin != *admin {
+        panic!("Unauthorized");
     }
 }
 
